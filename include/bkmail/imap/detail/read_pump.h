@@ -142,12 +142,16 @@ class read_pump {
     if (ec || n == 0) {
       // n == 0 is EOF (architecture §2.3): an orderly close after BYE
       // maps to server_bye; an unannounced EOF is a protocol violation.
+      // The mapping is decided under the lock: a recorded BYE is the
+      // server's announced reason for the connection ending, so it wins
+      // over any transport-level error (RST included).
       {
         std::lock_guard lock(ctx.mutex_);
         ctx.read_running_ = false;
-        if (!ec) {
-          ec = ctx.bye_received_ ? make_error_code(errc::server_bye)
-                                 : make_error_code(errc::unexpected_response);
+        if (ctx.bye_received_) {
+          ec = make_error_code(errc::server_bye);
+        } else if (!ec) {
+          ec = make_error_code(errc::unexpected_response);
         }
       }
       ctx.connection_lost(ec);

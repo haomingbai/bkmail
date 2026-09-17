@@ -387,6 +387,7 @@ class context_core
     cell_type stopped;
     cell_type rejected;
     bool post = false;
+    bool rejected_after_bye = false;
     {
       std::lock_guard lock(mutex_);
       if (phase_ == phase::open) {
@@ -407,7 +408,12 @@ class context_core
           post = kick;
         }
       } else {
+        // The failure reason is decided under the lock: a recorded
+        // unsolicited BYE wins over the generic cancelled code, so the
+        // NEXT operation surfaces server_bye no matter how long ago the
+        // connection actually died (usage.md §6 reconnect policy).
         rejected = std::move(cell);
+        rejected_after_bye = bye_received_;
       }
     }
     if (stopped != nullptr) {
@@ -416,7 +422,9 @@ class context_core
     }
     if (rejected != nullptr) {
       // Submissions on a closing/closed context fail immediately.
-      rejected->fail(std::make_error_code(std::errc::operation_canceled));
+      rejected->fail(rejected_after_bye
+                         ? make_error_code(errc::server_bye)
+                         : std::make_error_code(std::errc::operation_canceled));
       return;
     }
     if (post) {
