@@ -1,0 +1,30 @@
+build*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+Testing/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+.artifacts/
+coverage/
+.cache/
+.tmp*
+.tmp*/
+.env
+/env
+
+.agent
+
+# Exelude Copilot files
+.vscode/
+.github/
+!.github/workflows/
+
+# Exclude vim swap files
+*.swp
+.codebuddy/

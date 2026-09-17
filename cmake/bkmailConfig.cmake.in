@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(NOT TARGET bexec::bexec)
+  find_dependency(bexec @BKMAIL_BEXEC_MIN_VERSION@ CONFIG)
+endif()
+
+if(NOT TARGET bnio::bnio)
+  find_dependency(bnio @BKMAIL_BNIO_MIN_VERSION@ CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/bkmailTargets.cmake")
+
+check_required_components(bkmail)

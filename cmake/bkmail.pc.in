@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/@BKMAIL_PC_PREFIX_RELATIVE@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: bkmail
+Description: @PROJECT_DESCRIPTION@
+URL: https://github.com/haomingbai/bkmail
+Version: @PROJECT_VERSION@
+Requires: @BKMAIL_PC_REQUIRES@
+Libs: -L${libdir} -lbkmail
+Cflags: -I${includedir}@BKMAIL_PC_SHARED_CFLAGS@
