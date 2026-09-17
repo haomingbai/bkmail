@@ -59,6 +59,13 @@ namespace bkmail {
 namespace detail {
 
 /// Endpoints resolved per connect attempt (usage.md §3.2 shape).
+///
+/// Deliberately first-endpoint-only: the connection attempt opens the
+/// resolver's FIRST endpoint and does not fall back to the rest of the
+/// list (multi-endpoint failover is a future feature, not an oversight).
+/// The cap bounds the fixed dns_result_view storage; hosts resolving to
+/// more records than the cap simply expose fewer candidates to that
+/// never-consumed tail.
 inline constexpr std::size_t kMaxResolveEndpoints = 8;
 
 /// Greeting forms that select the initial session state.

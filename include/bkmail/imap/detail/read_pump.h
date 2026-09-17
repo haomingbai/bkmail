@@ -86,12 +86,38 @@ class read_pump {
    * Arms the single permanent read. Call only while no read is armed:
    * `prepare()` reallocates the read storage and must never race an
    * in-flight read (buffer stability, architecture §2.5).
+   *
+   * Runs entirely under the core mutex: the phase decision and the
+   * registration of the armed operation (the scripted stream records the
+   * armed read inside start()) form one critical section, so a
+   * concurrent abandon() either observes the armed read in its teardown
+   * delivery or wins the mutex first and this arm unwinds instead — the
+   * teardown completion is delivered exactly once under every
+   * interleaving, with no retries and no generation tracking. The mutex
+   * is recursive exactly because an eagerly-completed arm re-enters
+   * on_read on the same thread.
    */
   static void arm(std::shared_ptr<core_type> core) {
+    std::lock_guard lock(core->mutex_);
+    if (core->phase_ != core_type::phase::open ||
+        core->abandoned_.load(std::memory_order_acquire) ||
+        core->suspend_read_) {
+      // Teardown won the race: wind the pump down instead of arming.
+      core->read_running_ = false;
+      core->maybe_finish_close();
+      return;
+    }
+    // Materialize the allocator and the sender before the receiver
+    // factory: capturing `core` by move initializes the lambda as an
+    // argument of the same call, and with an unspecified argument
+    // evaluation order the other arguments would dereference a
+    // moved-from (null) shared_ptr. Both also re-enter the core mutex,
+    // which the recursive lock permits.
+    auto alloc = core->get_allocator();
+    auto sender = core->stream_.async_read_some(
+        core->scheduler(), core->read_buffer_.prepare(kReadChunk), 0);
     auto* box = make_io_box(
-        core->get_allocator(),
-        core->stream_.async_read_some(
-            core->scheduler(), core->read_buffer_.prepare(kReadChunk), 0),
+        std::move(alloc), std::move(sender),
         [core = std::move(core)](io_box_base* self) mutable {
           return read_receiver(self, std::move(core));
         });

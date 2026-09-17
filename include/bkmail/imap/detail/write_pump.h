@@ -49,6 +49,7 @@
 
 #include <bexec/scheduler.hpp>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -83,11 +84,19 @@ class write_pump {
       core->kick_posted_ = true;
     }
     try {
-      auto* box =
-          make_io_box(core->get_allocator(), bexec::schedule(core->scheduler()),
-                      [core = std::move(core)](io_box_base* self) mutable {
-                        return kick_receiver(self, std::move(core));
-                      });
+      // Materialize the allocator and the sender before the receiver
+      // factory: capturing `core` by move initializes the lambda as an
+      // argument of the same call, and with an unspecified argument
+      // evaluation order the other arguments would dereference a
+      // moved-from (null) shared_ptr. The lambda copies the shared_ptr
+      // so the catch path below still owns the core.
+      auto alloc = core->get_allocator();
+      auto sender = bexec::schedule(core->scheduler());
+      auto* box = make_io_box(
+          std::move(alloc), std::move(sender),
+          [core](io_box_base* self) mutable {
+            return kick_receiver(self, std::move(core));
+          });
       box->start();
     } catch (...) {
       // Allocation failure: unlatch so a later submission re-kicks; the
@@ -224,18 +233,67 @@ class write_pump {
   };
 
   /// Arms the single write-all operation over the staging buffer.
+  ///
+  /// Runs entirely under the core mutex: the phase decision and the
+  /// registration of the armed write (the scripted stream records the
+  /// armed write inside start()) form one critical section, so a
+  /// concurrent abandon() either observes the armed write in its
+  /// teardown delivery or wins the mutex first and this arm unwinds
+  /// instead — the teardown completion is delivered exactly once under
+  /// every interleaving. The mutex is recursive because an
+  /// eagerly-completed write re-enters on_write_done on the same thread.
   static void arm(
       std::shared_ptr<core_type> core,
       std::vector<operation_type*, rebind_alloc_t<Allocator, operation_type*>>
           staged) {
+    using cell_type = typename core_type::cell_type;
+    std::lock_guard lock(core->mutex_);
+    if (core->phase_ != core_type::phase::open ||
+        core->abandoned_.load(std::memory_order_acquire)) {
+      // Teardown won the race between kick()'s decision and this arm:
+      // the staged cells were kept in the queue for this write's
+      // completion, which will now never happen — retire them the way
+      // the write completion would have. During abandonment they are
+      // destroyed silently (handlers dropped, not invoked); during a
+      // close() drain they are failed with the cancellation code, like
+      // every other queued operation.
+      const bool abandoned =
+          core->abandoned_.load(std::memory_order_acquire);
+      std::vector<cell_type, rebind_alloc_t<Allocator, cell_type>> retired{
+          rebind_alloc_t<Allocator, cell_type>(core->get_allocator())};
+      for (auto* op : staged) {
+        if (auto cell = core->extract_from_queue_locked(op)) {
+          retired.push_back(std::move(cell));
+        }
+      }
+      core->write_in_flight_ = false;
+      if (abandoned) {
+        retired.clear();
+      } else {
+        for (auto& cell : retired) {
+          cell->fail(std::make_error_code(std::errc::operation_canceled));
+        }
+        retired.clear();
+      }
+      core->maybe_finish_close();
+      return;
+    }
+    // Materialize the allocator and the sender before the receiver
+    // factory: capturing `core` by move initializes the lambda as an
+    // argument of the same call, and with an unspecified argument
+    // evaluation order the other arguments would dereference a
+    // moved-from (null) shared_ptr. Both also re-enter the core mutex,
+    // which the recursive lock permits.
+    auto alloc = core->get_allocator();
+    auto sender = core->stream_.async_write(
+        core->scheduler(),
+        bnio::const_buffer(core->write_staging_.data(),
+                           core->write_staging_.size()),
+        MSG_NOSIGNAL);
     auto* box = make_io_box(
-        core->get_allocator(),
-        core->stream_.async_write(
-            core->scheduler(),
-            bnio::const_buffer(core->write_staging_.data(),
-                               core->write_staging_.size()),
-            MSG_NOSIGNAL),
-        [&core, staged = std::move(staged)](io_box_base* self) mutable {
+        std::move(alloc), std::move(sender),
+        [core = std::move(core),
+         staged = std::move(staged)](io_box_base* self) mutable {
           return write_receiver(self, std::move(core), std::move(staged));
         });
     box->start();

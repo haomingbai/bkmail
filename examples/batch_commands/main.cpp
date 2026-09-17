@@ -36,6 +36,7 @@
 #include <bkmail/bkmail.h>
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -140,6 +141,12 @@ int main(int argc, char* argv[]) {
   // Hand the connected, handshaken stream to bkmail. The context arms its
   // permanent read loop immediately and the greeting arrives through the
   // unsolicited path.
+  //
+  // Registration window: the greeting may be dispatched before the
+  // on_unsolicited registration below executes, in which case it is
+  // delivered to an empty table and silently dropped — acceptable for a
+  // demo that merely prints it. Applications that must observe the
+  // greeting should consume it through the layer-2 connect flow instead.
   im::imap_context<bnio::ssl_stream<bnio::tcp::socket>> ctx{std::move(stream),
                                                             runner.get()};
 
@@ -161,41 +168,58 @@ int main(int argc, char* argv[]) {
 
   // ---- Type-erased batch submission (usage.md §3.4) ----
 
-  // Handlers run on the io thread; the semaphore counts completions and the
-  // mutex serializes their printf output.
+  // Handlers run on the io thread; the semaphore counts completions and
+  // the mutex guards the output queue. Handlers never print: stdout can
+  // block (full pipe, slow terminal) and blocking an io thread would
+  // stall the read pump — the main thread prints everything at the end.
   std::counting_semaphore<8> completions{0};
-  std::mutex print_mutex;
+  std::mutex output_mutex;
+  std::vector<std::string> output;
+  std::atomic<bool> any_failed{false};
+
+  const auto enqueue_line = [&output_mutex, &output](std::string line) {
+    std::lock_guard lock(output_mutex);
+    output.push_back(std::move(line));
+  };
 
   bkmail::account_info<> account{.user_name = user, .password = password};
 
   std::vector<std::unique_ptr<im::imap_command<>>> batch;
   batch.push_back(
       im::make_command(im::login_command<>{account}, [&](std::error_code ec) {
-        std::lock_guard lock(print_mutex);
-        (void)failed("login", ec);
+        if (ec) any_failed = true;
+        enqueue_line(ec ? "login: " + ec.message() : "login: ok");
         completions.release();
       }));
   batch.push_back(im::make_command(
       im::capability_command<>{},
       [&](std::error_code ec, im::capability_set<> caps) {
-        std::lock_guard lock(print_mutex);
-        if (!failed("capability", ec)) {
-          std::printf("capabilities: IDLE=%d UIDPLUS=%d LITERAL+=%d\n",
-                      static_cast<int>(caps.contains("IDLE")),
-                      static_cast<int>(caps.contains("UIDPLUS")),
-                      static_cast<int>(caps.contains("LITERAL+")));
+        if (ec) {
+          any_failed = true;
+          enqueue_line("capability: " + ec.message());
+        } else {
+          enqueue_line("capabilities: IDLE=" +
+                       std::to_string(static_cast<int>(caps.contains("IDLE"))) +
+                       " UIDPLUS=" +
+                       std::to_string(static_cast<int>(caps.contains(
+                           "UIDPLUS"))) +
+                       " LITERAL+=" +
+                       std::to_string(static_cast<int>(
+                           caps.contains("LITERAL+"))));
         }
         completions.release();
       }));
   batch.push_back(im::make_command(
       im::list_command<>{"", "*"},
       [&](std::error_code ec, std::vector<im::mailbox_entry<>> entries) {
-        std::lock_guard lock(print_mutex);
-        if (!failed("list", ec)) {
+        if (ec) {
+          any_failed = true;
+          enqueue_line("list: " + ec.message());
+        } else {
           for (const auto& entry : entries) {
-            std::printf("mailbox: %s (delimiter %s%s)\n", entry.name.c_str(),
-                        entry.delimiter.c_str(),
-                        entry.no_select ? ", no-select" : "");
+            enqueue_line("mailbox: " + entry.name +
+                         " (delimiter " + entry.delimiter +
+                         (entry.no_select ? ", no-select)" : ")"));
           }
         }
         completions.release();
@@ -204,9 +228,9 @@ int main(int argc, char* argv[]) {
   const auto tags = ctx.submit(std::move(batch));
   ctx.flush();  // all three commands in one write
   {
-    std::lock_guard lock(print_mutex);
-    std::printf("submitted batch: login=%s capability=%s list=%s\n",
-                tags.at(0).c_str(), tags.at(1).c_str(), tags.at(2).c_str());
+    std::lock_guard lock(output_mutex);
+    output.push_back("submitted batch: login=" + tags.at(0) +
+                     " capability=" + tags.at(1) + " list=" + tags.at(2));
   }
 
   // Wait for all three tagged completions.
@@ -216,12 +240,19 @@ int main(int argc, char* argv[]) {
 
   // ---- LOGOUT as a second, separate round trip ----
   ctx.submit(im::logout_command<>{}, [&](std::error_code ec) {
-    std::lock_guard lock(print_mutex);
-    (void)failed("logout", ec);
+    if (ec) any_failed = true;
+    enqueue_line(ec ? "logout: " + ec.message() : "logout: ok");
     completions.release();
   });
   ctx.flush();
   completions.acquire();
 
-  return 0;
+  // Drain the output on the main thread only.
+  {
+    std::lock_guard lock(output_mutex);
+    for (const auto& line : output) {
+      std::printf("%s\n", line.c_str());
+    }
+  }
+  return any_failed.load() ? 1 : 0;
 }

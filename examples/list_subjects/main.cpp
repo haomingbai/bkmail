@@ -26,8 +26,11 @@
  * expunged. LOGOUT leaves the server state untouched.
  */
 
+#include <bexec/bexec.hpp>
 #include <bkmail/bkmail.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +57,30 @@ class io_runner {
   }
 
   [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
+
+  // Runs one empty task through the context and waits for it: when this
+  // returns, deferred teardown work scheduled on the io thread (e.g. the
+  // connection detained after LOGOUT) has finished, so exiting right
+  // after cannot cut a pending close short.
+  void quiesce() {
+    class done_receiver {
+     public:
+      explicit done_receiver(std::atomic<bool>& done) noexcept
+          : done_(done) {}
+      void set_value(std::error_code) noexcept { done_.store(true); }
+      void set_stopped() noexcept { done_.store(true); }
+
+     private:
+      std::atomic<bool>& done_;
+    };
+    std::atomic<bool> done{false};
+    auto operation = bexec::connect(ioc_.get_post_scheduler().schedule(),
+                                    done_receiver{done});
+    bexec::start(operation);
+    while (!done.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
 
  private:
   bnio::io_context ioc_;
@@ -145,16 +172,25 @@ int main(int argc, char* argv[]) {
   const std::uint32_t total = selected.mailbox().exists;
   std::printf("INBOX has %u messages\n", total);
   if (total == 0) {
-    (void)bth::sync_wait(std::move(selected).logout());
-    return 0;
+    auto logout = bth::sync_wait(std::move(selected).logout());
+    if (!logout) return 1;
+    const int rc = failed("logout", std::get<0>(*logout)) ? 1 : 0;
+    runner.quiesce();
+    return rc;
   }
 
   // FETCH the ENVELOPE of the five most recent messages.
   constexpr std::uint32_t kRecentCount = 5;
-  char range[16];
+  // "first:total" over two uint32_t needs at most 5 + 1 + 10 + 1 bytes;
+  // 24 leaves headroom and the truncation check catches the impossible.
+  char range[24];
   const std::uint32_t first =
       total > kRecentCount ? total - (kRecentCount - 1) : 1;
-  std::snprintf(range, sizeof range, "%u:%u", first, total);
+  const int written = std::snprintf(range, sizeof range, "%u:%u", first, total);
+  if (written < 0 || static_cast<std::size_t>(written) >= sizeof range) {
+    std::fprintf(stderr, "sequence-set does not fit the buffer\n");
+    return 1;
+  }
   auto fetched = bth::sync_wait(std::move(selected).fetch_envelopes(range));
   if (!fetched) return 1;
   auto& [fetch_ec, envelopes, selected_back] = *fetched;
@@ -168,5 +204,7 @@ int main(int argc, char* argv[]) {
   auto done = bth::sync_wait(std::move(selected_back).logout());
   if (!done) return 1;
   auto& [logout_ec, logged_out] = *done;
-  return failed("logout", logout_ec) ? 1 : 0;
+  const int rc = failed("logout", logout_ec) ? 1 : 0;
+  runner.quiesce();
+  return rc;
 }

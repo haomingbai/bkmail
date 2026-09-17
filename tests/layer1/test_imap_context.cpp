@@ -205,8 +205,9 @@ TEST(ImapContext, CancelWrittenCommandDropsLateResponse) {
   h.ctx.flush();
 
   ASSERT_TRUE(second_done.wait_for(kDefaultTimeout));
-  // Give the late a0001 reply a chance to be (mis)dispatched.
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  // No sleep needed: both replies live in one scripted chunk and are
+  // dispatched in chunk order, so second_done proves the late a0001
+  // reply was already processed (and dropped).
   EXPECT_EQ(0, first_calls.load())
       << "the detached operation's reply must be dropped on arrival";
 }
@@ -219,7 +220,8 @@ TEST(ImapContext, CancelPendingIdleSendsDoneFirst) {
       expect_write{"a0001 IDLE"},
       server_bytes{"+ idling\r\n"},
       expect_write{"DONE\r\n"},
-      server_bytes{"a0001 OK IDLE terminated\r\n"},
+      server_bytes{"a0001 OK IDLE terminated\r\n"
+                   "a0002 OK NOOP completed\r\n"},
   });
 
   std::atomic<int> idle_calls{0};
@@ -228,11 +230,21 @@ TEST(ImapContext, CancelPendingIdleSendsDoneFirst) {
   h.ctx.flush();
   ASSERT_TRUE(h.recorder.wait_written("a0001 IDLE", kDefaultTimeout));
 
+  // Registered before cancel(): its tagged reply is dispatched after the
+  // a0001 line (in-chunk order), so its completion is the deterministic
+  // handshake proving the withdrawn IDLE handler was never invoked.
+  signal_event after_idle;
+  h.ctx.submit(im::noop_command<>{},
+               [&](std::error_code ec) {
+                 EXPECT_FALSE(ec) << ec.message();
+                 after_idle.arrive();
+               });
+
   h.ctx.cancel(idle_tag);
 
   ASSERT_TRUE(h.recorder.wait_written("DONE\r\n", kDefaultTimeout))
       << "cancelling a pending IDLE must send DONE first";
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  ASSERT_TRUE(after_idle.wait_for(kDefaultTimeout));
   EXPECT_EQ(0, idle_calls.load())
       << "a cancelled handler is withdrawn, never invoked";
 }

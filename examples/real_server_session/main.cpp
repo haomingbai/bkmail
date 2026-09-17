@@ -16,8 +16,8 @@
  * The session is strictly READ-ONLY: connect (implicit TLS) -> login
  * (AUTHENTICATE PLAIN when advertised, LOGIN otherwise) -> LIST -> EXAMINE
  * INBOX (never SELECT — no write side effects) -> FETCH ENVELOPE -> FETCH
- * BODY.PEEK[] (never sets \Seen) -> LOGOUT. STORE/EXPUNGE/APPEND/COPY/
- * MOVE/DELETE/CLOSE are never issued.
+ * BODY.PEEK[HEADER.FIELDS (...)] (bounded preview, never sets \Seen) ->
+ * LOGOUT. STORE/EXPUNGE/APPEND/COPY/MOVE/DELETE/CLOSE are never issued.
  *
  * Usage:
  *   real_server_session <host> [port]        (port defaults to 993)
@@ -29,8 +29,11 @@
  * host, the step results, and mailbox data appear in the output.
  */
 
+#include <bexec/bexec.hpp>
 #include <bkmail/bkmail.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,6 +61,30 @@ class io_runner {
   }
 
   [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
+
+  // Runs one empty task through the context and waits for it: when this
+  // returns, deferred teardown work scheduled on the io thread (e.g. the
+  // connection detained after LOGOUT) has finished, so exiting right
+  // after cannot cut a pending close short.
+  void quiesce() {
+    class done_receiver {
+     public:
+      explicit done_receiver(std::atomic<bool>& done) noexcept
+          : done_(done) {}
+      void set_value(std::error_code) noexcept { done_.store(true); }
+      void set_stopped() noexcept { done_.store(true); }
+
+     private:
+      std::atomic<bool>& done_;
+    };
+    std::atomic<bool> done{false};
+    auto operation = bexec::connect(ioc_.get_post_scheduler().schedule(),
+                                    done_receiver{done});
+    bexec::start(operation);
+    while (!done.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
 
  private:
   bnio::io_context ioc_;
@@ -88,25 +115,6 @@ using state_outcome = std::tuple<std::error_code, State>;
     std::exit(2);
   }
   return value;
-}
-
-/// Prints the leading `max_lines` lines of a message section.
-void print_message_head(const std::vector<std::byte>& data, size_t max_lines) {
-  size_t pos = 0;
-  for (size_t line = 0; line < max_lines && pos < data.size(); ++line) {
-    size_t end = pos;
-    while (end < data.size() && data[end] != std::byte{'\n'} &&
-           data[end] != std::byte{'\r'}) {
-      ++end;
-    }
-    std::printf("  %.*s\n", static_cast<int>(end - pos),
-                reinterpret_cast<const char*>(data.data() + pos));
-    while (end < data.size() &&
-           (data[end] == std::byte{'\n'} || data[end] == std::byte{'\r'})) {
-      ++end;
-    }
-    pos = end;
-  }
 }
 
 }  // namespace
@@ -200,58 +208,44 @@ int main(int argc, char* argv[]) {
 
   im::selected_state<> back = std::move(selected);
   if (total > 0) {
-    // Message list: ENVELOPEs of the newest few messages.
+    // Header preview of the newest messages via
+    // BODY.PEEK[HEADER.FIELDS (...)] — bounded on the wire and in memory,
+    // never sets \Seen. (A full BODY.PEEK[] would buffer arbitrarily
+    // large messages — up to the whole mailbox — before printing.)
     constexpr std::uint32_t kListCount = 5;
     const std::uint32_t first =
         total > kListCount ? total - (kListCount - 1) : 1;
-    char range[16];
-    std::snprintf(range, sizeof range, "%u:%u", first, total);
-    auto fetched = bth::sync_wait(std::move(back).fetch_envelopes(range));
+    // "first:total" over two uint32_t needs at most 5 + 1 + 10 + 1 bytes;
+    // 24 leaves headroom and the truncation check catches the impossible.
+    char range[24];
+    const int written =
+        std::snprintf(range, sizeof range, "%u:%u", first, total);
+    if (written < 0 || static_cast<std::size_t>(written) >= sizeof range) {
+      std::fprintf(stderr, "sequence-set does not fit the buffer\n");
+      return 1;
+    }
+    auto fetched = bth::sync_wait(
+        std::move(back).fetch_headers(range, {"Date", "From", "Subject"}));
     if (!fetched) return 1;
     auto& [fetch_ec, envelopes, sel1] = *fetched;
-    if (failed("fetch envelopes", fetch_ec)) return 1;
+    if (failed("fetch headers", fetch_ec)) return 1;
     std::printf("== newest %zu message(s):\n", envelopes.size());
-    for (const auto& env : envelopes) {
+    std::uint32_t seq = first;
+    for (const auto& m : envelopes) {
       std::string from;
-      if (!env.from.empty()) from = env.from.front().email();
-      std::printf("  [%s] %s — %s\n", env.date.c_str(), from.c_str(),
-                  env.subject.c_str());
+      if (!m.from.empty()) from = m.from.front().email();
+      std::printf("  #%u [%s] %s — %s\n", seq, m.date.c_str(), from.c_str(),
+                  m.subject.c_str());
+      ++seq;
     }
-
-    // Print the leading lines of the two newest messages
-    // (BODY.PEEK[] — reading never sets \Seen).
-    constexpr std::uint32_t kPrintCount = 2;
-    const std::uint32_t print_first =
-        total > kPrintCount ? total - (kPrintCount - 1) : 1;
-    im::selected_state<> sel = std::move(sel1);
-    for (std::uint32_t seq = print_first; seq <= total; ++seq) {
-      char one[16];
-      std::snprintf(one, sizeof one, "%u", seq);
-      auto message = bth::sync_wait(std::move(sel).fetch_message(one));
-      if (!message) return 1;
-      auto& [msg_ec, mails, sel_back] = *message;
-      if (failed("fetch message", msg_ec)) return 1;
-      if (mails.empty()) {
-        sel = std::move(sel_back);
-        continue;
-      }
-      const auto& m = mails.front();
-      std::string from;
-      if (!m.header.from.empty()) from = m.header.from.front().email();
-      std::printf("== message #%u: [%s] %s — %s\n", seq, m.header.date.c_str(),
-                  from.c_str(), m.header.subject.c_str());
-      std::printf("   content-type: %s, body %zu octet(s):\n",
-                  m.body.content_type.c_str(), m.body.data.size());
-      print_message_head(m.body.data, 12);
-      sel = std::move(sel_back);
-    }
-    back = std::move(sel);
+    back = std::move(sel1);
   }
 
   // LOGOUT.
   auto done = bth::sync_wait(std::move(back).logout());
   if (!done) return 1;
-  if (failed("logout", std::get<0>(*done))) return 1;
+  const int rc = failed("logout", std::get<0>(*done)) ? 1 : 0;
+  runner.quiesce();
   std::printf("== logged out\n");
-  return 0;
+  return rc;
 }

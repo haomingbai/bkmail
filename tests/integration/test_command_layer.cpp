@@ -274,10 +274,15 @@ TEST(CommandLayer, TypeErasedBatchSubmission) {
 TEST(CommandLayer, UnsolicitedEventsAreDispatched) {
   context_holder h({
       server_bytes{std::string(kGreeting)},
+      // Gated: the pushes are withheld until the client wrote its first
+      // command, so the on_unsolicited registration below can never lose
+      // the race against the read pump's dispatch.
+      expect_write{"a0001 NOOP"},
       server_bytes{"* 7 EXISTS\r\n"
                    "* 2 EXPUNGE\r\n"
                    "* 4 FETCH (FLAGS (\\Seen \\Deleted))\r\n"
-                   "* CAPABILITY IMAP4rev1 UIDPLUS\r\n"},
+                   "* CAPABILITY IMAP4rev1 UIDPLUS\r\n"
+                   "a0001 OK NOOP completed\r\n"},
   });
 
   struct seen_event {
@@ -309,13 +314,17 @@ TEST(CommandLayer, UnsolicitedEventsAreDispatched) {
             event);
       });
 
-  // Wait until all four scripted pushes were observed.
-  ASSERT_TRUE(poll_until(
-      [&] {
-        std::lock_guard lock(mutex);
-        return events.size() >= 4U;
-      },
-      kDefaultTimeout));
+  // The gate-opening NOOP's tagged reply is dispatched after the four
+  // pushes (in-chunk order), so its completion is a deterministic
+  // handshake proving the handler observed every push — no polling.
+  signal_event noop_done;
+  h.ctx.submit(im::noop_command<>{},
+               [&](std::error_code ec) {
+                 EXPECT_FALSE(ec) << ec.message();
+                 noop_done.arrive();
+               });
+  h.ctx.flush();
+  ASSERT_TRUE(noop_done.wait_for(kDefaultTimeout));
 
   std::lock_guard lock(mutex);
   ASSERT_EQ(4U, events.size());
@@ -389,8 +398,9 @@ TEST(CommandLayer, CancelWrittenCommandDropsLateResponse) {
   h.ctx.flush();
 
   ASSERT_TRUE(second_done.wait_for(kDefaultTimeout));
-  // Give the late a0001 reply a chance to be (mis)dispatched.
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  // No sleep needed: both replies live in one scripted chunk and are
+  // dispatched in chunk order, so second_done proves the late a0001
+  // reply was already processed (and dropped).
   EXPECT_EQ(0, first_calls.load());
 }
 
@@ -402,7 +412,8 @@ TEST(CommandLayer, CancelPendingIdleSendsDone) {
       expect_write{"a0001 IDLE"},
       server_bytes{"+ idling\r\n"},
       expect_write{"DONE\r\n"},
-      server_bytes{"a0001 OK IDLE terminated\r\n"},
+      server_bytes{"a0001 OK IDLE terminated\r\n"
+                   "a0002 OK NOOP completed\r\n"},
   });
 
   std::atomic<int> idle_calls{0};
@@ -411,11 +422,21 @@ TEST(CommandLayer, CancelPendingIdleSendsDone) {
   h.ctx.flush();
   ASSERT_TRUE(h.recorder.wait_written("IDLE", kDefaultTimeout));
 
+  // Registered before cancel(): its tagged reply is dispatched after the
+  // a0001 line (in-chunk order), so its completion is the deterministic
+  // handshake proving the withdrawn IDLE handler was never invoked.
+  signal_event after_idle;
+  h.ctx.submit(im::noop_command<>{},
+               [&](std::error_code ec) {
+                 EXPECT_FALSE(ec) << ec.message();
+                 after_idle.arrive();
+               });
+
   h.ctx.cancel(idle_tag);
 
   ASSERT_TRUE(h.recorder.wait_written("DONE\r\n", kDefaultTimeout))
       << "cancelling a pending IDLE must send DONE";
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  ASSERT_TRUE(after_idle.wait_for(kDefaultTimeout));
   EXPECT_EQ(0, idle_calls.load())
       << "a cancelled handler is withdrawn, never invoked";
 }
@@ -476,6 +497,10 @@ TEST(CommandLayer, NoAndBadMapToErrc) {
 // (is_alive() flips) once the server hangs up.
 TEST(CommandLayer, ByeGreetingSurfacesAsByeEvent) {
   context_holder h({
+      // Gated: the BYE greeting is withheld until the client wrote its
+      // first command, so the registration below can never lose the race
+      // against the read pump's dispatch.
+      expect_write{"a0001 NOOP"},
       server_bytes{"* BYE server is going away\r\n"},
       server_eof{},
   });
@@ -494,6 +519,10 @@ TEST(CommandLayer, ByeGreetingSurfacesAsByeEvent) {
             },
             event);
       });
+
+  // Opening the gate: the write happens strictly after the registration.
+  h.ctx.submit(im::noop_command<>{}, [](std::error_code) {});
+  h.ctx.flush();
 
   ASSERT_TRUE(bye_seen.wait_for(kDefaultTimeout));
   EXPECT_NE(std::string::npos, bye_text.find("going away"));

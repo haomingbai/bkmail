@@ -271,6 +271,9 @@ TEST(ErrorPaths, StopTokenCancelsInFlightOperation) {
   EXPECT_EQ(0, value_calls.load());
 
   EXPECT_TRUE(server.wait_done(kDefaultTimeout));
+  // Barrier: the io worker must have left the receiver call chain before
+  // the stack-allocated operation state and receiver go out of scope.
+  runner.quiesce();
 }
 
 }  // namespace

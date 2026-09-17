@@ -25,10 +25,13 @@
 
 #include <bnio/io_context.h>
 
+#include <bexec/bexec.hpp>
+
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -53,6 +56,16 @@ class io_runner {
   /// The context borrowed by sessions under test.
   [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
 
+  /**
+   * Runs one empty task through the io_context and waits for it on the
+   * calling thread: when this returns, the worker has finished executing
+   * every completion that was in flight before the call — a happens-before
+   * barrier proving the worker is outside any receiver call chain (used
+   * before destroying test-stack objects those receivers reference).
+   * Defined after signal_event below.
+   */
+  void quiesce();
+
  private:
   bnio::io_context ioc_;
   std::thread thread_;
@@ -66,11 +79,13 @@ class io_runner {
 class signal_event {
  public:
   /// Records one arrival; never blocks.
+  ///
+  /// Notifies WHILE holding the mutex: a waiter returns from wait() with
+  /// the mutex held, so the notifier's notify_all has already returned —
+  /// destroying the event after a satisfied wait is then race-free.
   void arrive() {
-    {
-      std::lock_guard lock(mutex_);
-      ++count_;
-    }
+    std::lock_guard lock(mutex_);
+    ++count_;
     cv_.notify_all();
   }
 
@@ -114,6 +129,30 @@ template <class Predicate, class Rep, class Period>
 /// Default bound for the scripted exchanges in this test suite; generous so
 /// CI stalls surface as readable failures instead of flaky timeouts.
 inline constexpr std::chrono::milliseconds kDefaultTimeout{10000};
+
+namespace detail {
+
+/// Receiver completing io_runner::quiesce()'s empty barrier task.
+class quiesce_receiver {
+ public:
+  explicit quiesce_receiver(signal_event* done) noexcept : done_(done) {}
+
+  void set_value(std::error_code) noexcept { done_->arrive(); }
+  void set_stopped() noexcept { done_->arrive(); }
+
+ private:
+  signal_event* done_;
+};
+
+}  // namespace detail
+
+inline void io_runner::quiesce() {
+  signal_event done;
+  auto operation = bexec::connect(ioc_.get_post_scheduler().schedule(),
+                                  detail::quiesce_receiver{&done});
+  bexec::start(operation);
+  done.wait();
+}
 
 }  // namespace bkmail::test
 

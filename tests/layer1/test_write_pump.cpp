@@ -246,6 +246,9 @@ TEST(WritePump, SenderPathKicksWriteOnEmptyQueue) {
   EXPECT_FALSE(ec) << ec.message();
   EXPECT_TRUE(h.recorder.contains_written("a0001 NOOP"));
   EXPECT_EQ(1U, h.recorder.writes().size());
+  // Barrier: the io worker must have left the receiver call chain before
+  // the stack-allocated operation state and receiver go out of scope.
+  h.runner.quiesce();
 }
 
 }  // namespace

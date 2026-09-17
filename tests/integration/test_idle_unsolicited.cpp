@@ -216,6 +216,9 @@ TEST(IdleUnsolicited, IdleCancelSendsDoneAndCompletesStopped) {
 
   EXPECT_TRUE(server.wait_done(kDefaultTimeout));
   EXPECT_TRUE(server.ok()) << server.errors();
+  // Barrier: the io worker must have left the receiver call chain before
+  // the stack-allocated operation state and receiver go out of scope.
+  runner.quiesce();
 }
 
 // usage.md §2.1: unsolicited EXPUNGE/FETCH(FLAGS) pushed between commands

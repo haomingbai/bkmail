@@ -71,12 +71,12 @@ TEST(Envelope, HasTenWireFieldsInOrder) {
   // in_reply_to, message_id.
   bkmail::envelope<> env{"Mon, 7 Sep 2026 00:00:00 +0000",
                          "subject",
-                         {{{.mailbox_name = "from", .host_name = "a.dev"}}},
-                         {{{.mailbox_name = "sender", .host_name = "b.dev"}}},
-                         {{{.mailbox_name = "reply", .host_name = "c.dev"}}},
-                         {{{.mailbox_name = "to", .host_name = "d.dev"}}},
-                         {{{.mailbox_name = "cc", .host_name = "e.dev"}}},
-                         {{{.mailbox_name = "bcc", .host_name = "f.dev"}}},
+                         {{.mailbox_name = "from", .host_name = "a.dev"}},
+                         {{.mailbox_name = "sender", .host_name = "b.dev"}},
+                         {{.mailbox_name = "reply", .host_name = "c.dev"}},
+                         {{.mailbox_name = "to", .host_name = "d.dev"}},
+                         {{.mailbox_name = "cc", .host_name = "e.dev"}},
+                         {{.mailbox_name = "bcc", .host_name = "f.dev"}},
                          "<parent@a.dev>",
                          "<child@a.dev>"};
   EXPECT_EQ("Mon, 7 Sep 2026 00:00:00 +0000", env.date);

@@ -203,31 +203,57 @@ class fake_imap_server {
       finish();
       return;
     }
+    // Set when the script aborted: the client may be blocked on a reply
+    // that will now never come, so the connection must be shut down to
+    // turn the scripted failure into a clean client-side error instead of
+    // a test-suite stall.
+    bool aborted = false;
     for (const auto& step : steps) {
       if (const auto* expect = std::get_if<expect_client>(&step)) {
         if (!await_bytes(expect->substring)) {
           record_error("timeout/disconnect waiting for client bytes: \"" +
                        expect->substring + "\"");
+          aborted = true;
           break;
         }
         if (!expect->forbid.empty()) {
+          // Position-exact check: a violation is forbidden bytes INSIDE
+          // the stream the gate just matched (positions before the gate
+          // end). Everything received later appends beyond it and is
+          // legitimate — so the check needs no deferred re-scan and no
+          // race window against bytes still in flight.
           std::lock_guard lock(mutex_);
-          if (received_.find(expect->forbid) != std::string::npos) {
+          const std::size_t forbidden_pos = received_.find(expect->forbid);
+          if (forbidden_pos != std::string::npos &&
+              forbidden_pos < search_cursor_) {
             record_error("client wrote forbidden bytes before the gate: \"" +
                          expect->forbid + "\"");
           }
         }
       } else if (const auto* send = std::get_if<server_send>(&step)) {
-        if (!send_all(expand_tag(send->bytes))) {
+        bool expanded = true;
+        const std::string expanded_bytes = expand_tag(send->bytes, expanded);
+        if (!expanded) {
+          record_error("{tag} used before any client command was matched");
+          aborted = true;
+          break;
+        }
+        if (!send_all(expanded_bytes)) {
           record_error("failed to send scripted bytes to the client");
+          aborted = true;
           break;
         }
       }
     }
-    if (close_at_end) {
+    if (close_at_end || aborted) {
       std::lock_guard lock(mutex_);
       close_conn_locked();
     }
+    // Deliberately NOT ::close()ing the descriptor here when the script
+    // succeeded with close_at_end == false: such scripts intentionally
+    // keep the connection open (e.g. stop-token tests where an EOF would
+    // race the cancellation). The descriptor is ::close()d by the
+    // destructor after join().
     finish();
   }
 
@@ -335,13 +361,22 @@ class fake_imap_server {
     }
   }
 
-  std::string expand_tag(std::string bytes) const {
+  /// Replaces `{tag}` with the most recently captured command tag. Sets
+  /// @p ok to false (leaving @p bytes untouched) when the placeholder is
+  /// used but no client command was matched yet — silently expanding to
+  /// an empty string would fabricate a malformed server response.
+  std::string expand_tag(std::string bytes, bool& ok) const {
     std::lock_guard lock(mutex_);
     const std::string placeholder = "{tag}";
+    if (bytes.find(placeholder) != std::string::npos && last_tag_.empty()) {
+      ok = false;
+      return bytes;
+    }
     for (std::size_t pos = bytes.find(placeholder); pos != std::string::npos;
          pos = bytes.find(placeholder, pos + last_tag_.size())) {
       bytes.replace(pos, placeholder.size(), last_tag_);
     }
+    ok = true;
     return bytes;
   }
 
@@ -386,9 +421,12 @@ class fake_imap_server {
 
   void close_conn_locked() {
     if (conn_fd_ >= 0) {
+      // Shut down only: the server thread may still be inside send(),
+      // recv() or poll() on this descriptor, and ::close() from another
+      // thread would race that use (or let a recycled descriptor number
+      // dangle inside it). The descriptor itself is ::close()d by the
+      // server thread when run() ends, or by the destructor after join().
       (void)::shutdown(conn_fd_, SHUT_RDWR);
-      (void)::close(conn_fd_);
-      conn_fd_ = -1;
       cv_.notify_all();
     }
   }
@@ -404,14 +442,26 @@ class fake_imap_server {
   void stop_and_join() {
     {
       std::lock_guard lock(mutex_);
+      // Wake the server thread without closing anything it may still be
+      // using; descriptors are ::close()d after join().
       close_conn_locked();
       if (listen_fd_ >= 0) {
-        (void)::close(listen_fd_);
-        listen_fd_ = -1;
+        (void)::shutdown(listen_fd_, SHUT_RDWR);
       }
     }
     if (thread_.joinable()) {
       thread_.join();
+    }
+    {
+      std::lock_guard lock(mutex_);
+      if (conn_fd_ >= 0) {
+        ::close(conn_fd_);
+        conn_fd_ = -1;
+      }
+      if (listen_fd_ >= 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+      }
     }
   }
 

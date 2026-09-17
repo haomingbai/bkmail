@@ -35,6 +35,7 @@
  * never stores flags, moves, or expunges anything.
  */
 
+#include <bexec/bexec.hpp>
 #include <bkmail/bkmail.h>
 
 #include <atomic>
@@ -74,6 +75,30 @@ class io_runner {
   }
 
   [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
+
+  // Runs one empty task through the context and waits for it: when this
+  // returns, deferred teardown work scheduled on the io thread (e.g. the
+  // connection detained after LOGOUT) has finished, so exiting right
+  // after cannot cut a pending close short.
+  void quiesce() {
+    class done_receiver {
+     public:
+      explicit done_receiver(std::atomic<bool>& done) noexcept
+          : done_(done) {}
+      void set_value(std::error_code) noexcept { done_.store(true); }
+      void set_stopped() noexcept { done_.store(true); }
+
+     private:
+      std::atomic<bool>& done_;
+    };
+    std::atomic<bool> done{false};
+    auto operation = bexec::connect(ioc_.get_post_scheduler().schedule(),
+                                    done_receiver{done});
+    bexec::start(operation);
+    while (!done.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
 
  private:
   bnio::io_context ioc_;
@@ -208,11 +233,26 @@ int main(int argc, char* argv[]) {
       bexec::start(op);
 
       // Wait for the cycle to end, polling the SIGINT flag; request stop
-      // from this thread, never from the signal handler.
+      // from this thread, never from the signal handler. Once a stop was
+      // requested, allow a grace period for the DONE + tagged-reply
+      // exchange: on a half-open connection the server's receipt never
+      // arrives, and waiting forever would hang the example.
+      std::chrono::steady_clock::time_point stop_deadline{};
       while (!outcome.done.try_acquire_for(std::chrono::milliseconds{100})) {
         if (!stop_requested && g_sigint_seen.load()) {
           stop_requested = true;
+          stop_deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds{10};
           stop_src.request_stop();
+        }
+        if (stop_requested &&
+            std::chrono::steady_clock::now() > stop_deadline) {
+          // The started idle() operation state cannot be destroyed while
+          // in flight, and waiting longer cannot help — exit the process
+          // without unwinding; the OS reclaims the descriptors.
+          std::fprintf(stderr,
+                       "server did not confirm the cancellation; exiting\n");
+          std::_Exit(1);
         }
       }
       // `op` must not outlive the completion it delivered.
@@ -248,6 +288,9 @@ int main(int argc, char* argv[]) {
   }
 
   if (cancelled) {
+    // The idle cycle completed with set_stopped; let the io thread finish
+    // any deferred teardown before the runner goes away.
+    runner.quiesce();
     return 0;
   }
 
@@ -255,5 +298,7 @@ int main(int argc, char* argv[]) {
   auto done = bth::sync_wait(std::move(selected).logout());
   if (!done) return 1;
   auto& [logout_ec, logged_out] = *done;
-  return failed("logout", logout_ec) ? 1 : 0;
+  const int rc = failed("logout", logout_ec) ? 1 : 0;
+  runner.quiesce();
+  return rc;
 }

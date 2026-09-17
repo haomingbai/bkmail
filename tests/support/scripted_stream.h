@@ -43,7 +43,11 @@
  * Completion contract (identical to bnio sockets, docs/architecture.md §2.1):
  * every operation completes with `set_value(std::error_code, std::size_t)` or
  * `set_stopped()`; there is no error channel. Stop tokens are observed at the
- * same points bnio observes them (start/post points, §2.6). Completions are
+ * same points bnio observes them (start/post points, §2.6) — and only there:
+ * a read parked on a never-satisfied `expect_write` gate observes a stop
+ * request no earlier than the next drive pass, so tests that cancel such a
+ * read must follow the request with one more operation that triggers a drive
+ * (any submission or flush). Completions are
  * always delivered from a task posted onto the scheduler passed to the async
  * call — never inline from `start()` — mirroring bnio's behaviour and keeping
  * handler threads exactly as documented in usage.md §7.
@@ -204,8 +208,7 @@ struct script_state {
  * Runs one pass of the script engine on the scheduler thread: completes the
  * armed write (if any) and the armed read (if the next step is deliverable).
  */
-inline void drive_script(const std::shared_ptr<script_state>& state) noexcept {
-  scripted_write_op_base* write_op = nullptr;
+inline void drive_script(const std::shared_ptr<script_state>& state) noexcept {  scripted_write_op_base* write_op = nullptr;
   scripted_read_op_base* read_op = nullptr;
   std::error_code write_ec;
   std::error_code read_ec;
@@ -503,8 +506,11 @@ class scripted_write_operation final : public scripted_write_op_base {
       }
       state_->pending_write = this;
       post_drive_locked(state_, scheduler_);
+      // Notified under the lock: a waiter returns from its wait holding
+      // the mutex, so this notify has already returned before the
+      // waiter's thread can destroy the cv (mirrors signal_event::arrive).
+      state_->write_cv.notify_all();
     }
-    state_->write_cv.notify_all();
   }
 
   [[nodiscard]] std::size_t size() const noexcept override {
@@ -723,6 +729,63 @@ class scripted_stream {
   /// Access to shutdown()/close(), as required by the stream concept.
   [[nodiscard]] const bnio::tcp::socket& lowest_layer() const noexcept {
     return socket_;
+  }
+
+  /// Optional stream extension consumed by `context_core::abandon()` (via
+  /// a requires-expression): a real transport completes the armed read
+  /// with EOF as soon as the abandonment protocol shut the read side down
+  /// (SHUT_RD), which retires the pump boxes and lets the context core
+  /// destroy itself. The script engine cannot observe
+  /// `lowest_layer().shutdown()`, so `abandon()` asks the stream to
+  /// deliver the same effect explicitly.
+  ///
+  /// Runs inline on the caller's thread — the abandonment path is quiet
+  /// (no handler runs), so no scheduler round-trip is needed; this also
+  /// keeps working when the owning io_context is already gone (a shell
+  /// that outlived its runner). Mirrors drive_script's stop-token
+  /// arbitration.
+  void complete_pending_io_for_teardown() noexcept {
+    detail::scripted_write_op_base* write_op = nullptr;
+    detail::scripted_read_op_base* read_op = nullptr;
+    std::error_code write_ec;
+    bool write_stopped = false;
+    bool read_stopped = false;
+    std::size_t write_n = 0;
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->pending_write != nullptr) {
+        write_op = state_->pending_write;
+        state_->pending_write = nullptr;
+        if (write_op->stop_requested()) {
+          write_stopped = true;
+        } else {
+          write_ec = state_->pending_write_ec;
+          write_n = write_op->size();
+        }
+      }
+      if (state_->pending_read != nullptr) {
+        read_op = state_->pending_read;
+        state_->pending_read = nullptr;
+        read_stopped = read_op->stop_requested();
+      }
+    }
+    // Completions run without the lock; the abandonment path invokes no
+    // user code, so inline delivery is safe (and required: the scheduler
+    // may already be gone).
+    if (write_op != nullptr) {
+      if (write_stopped) {
+        write_op->complete_stopped();
+      } else {
+        write_op->complete(write_ec, write_n);
+      }
+    }
+    if (read_op != nullptr) {
+      if (read_stopped) {
+        read_op->complete_stopped();
+      } else {
+        read_op->complete(std::error_code{}, 0);  // n == 0 is EOF.
+      }
+    }
   }
 
   /// Convenience forwarder, see script_recorder::written(). Only valid

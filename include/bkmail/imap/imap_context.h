@@ -343,6 +343,25 @@ class context_core
     // Cell destruction runs user receiver destructors; outside the lock,
     // and never through a completion (dropped, not invoked).
     dropped.clear();
+    // A real transport completes the armed read (and any in-flight write)
+    // once SHUT_RD happened, which retires the pump boxes so the core can
+    // destroy itself. Streams that cannot observe the shutdown opt in to
+    // the same effect explicitly (tests/scripted_stream); the bnio
+    // sockets do not implement the extension and complete via the kernel.
+    //
+    // Ordering against a concurrent pump re-arm comes from the recursive
+    // mutex itself: the pumps decide the phase and register the armed
+    // operation inside one critical section (read_pump/write_pump
+    // arm()), so this delivery is serialized against every arm — either
+    // the armed operation is already registered and gets completed here,
+    // or this abandon() won the mutex and the losing arm unwinds instead
+    // of arming. Under every interleaving exactly one side delivers the
+    // teardown completion.
+    if constexpr (requires {
+      stream_.complete_pending_io_for_teardown();
+    }) {
+      stream_.complete_pending_io_for_teardown();
+    }
     maybe_finish_close();
   }
 
@@ -604,10 +623,14 @@ class context_core
 
   // ---- members ------------------------------------------------------------
 
-  // Coherence lock. Presence is documented so implementers know the
-  // invariant set; bkmail makes NO public thread-safety promise about
-  // concurrent API calls on one context (architecture §6).
-  mutable std::mutex mutex_;
+  // Coherence lock. Recursive: the pump arm() paths hold it across the
+  // registration of the armed operation, and an eagerly-completed arm
+  // re-enters the completion path on the same thread (the scripted test
+  // stream delivers through a scheduler fast path; bnio sockets complete
+  // from their worker instead). Presence is documented so implementers
+  // know the invariant set; bkmail makes NO public thread-safety promise
+  // about concurrent API calls on one context (architecture §6).
+  mutable std::recursive_mutex mutex_;
 
   bnio::io_context* ioc_;  // borrowed; see set_io_context contract
   Stream stream_;          // owned I/O credential
