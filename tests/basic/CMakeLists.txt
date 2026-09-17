@@ -1,0 +1,2 @@
+add_executable(bkmail_basic_tests test_version.cpp)
+bkmail_add_gtest(bkmail_basic_tests basic)

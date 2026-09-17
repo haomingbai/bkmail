@@ -1,0 +1,120 @@
+/**
+ * @file tests/support/io_runner.h
+ * @brief Dedicated-thread bnio::io_context runner plus test sync helpers.
+ * @author Haoming Bai <haomingbai@hotmail.com>
+ * @date   2026-09-16
+ *
+ * Copyright © 2026 Haoming Bai
+ * SPDX-License-Identifier: MIT
+ *
+ * @details
+ * `io_runner` is the helper from usage.md §1.3: a bkmail sender only makes
+ * progress while some thread runs the borrowed `bnio::io_context`, so every
+ * test that consumes senders with `bexec::this_thread::sync_wait` keeps one
+ * of these alive for the duration of the session.
+ *
+ * `signal_event` and `poll_until` cover the other direction: handlers and
+ * unsolicited callbacks fire on the io thread, and the test thread needs a
+ * bounded wait for them (`signal_event`) or for a condition that offers no
+ * notification hook (`poll_until`, e.g. `imap_context::is_alive()`).
+ */
+
+#pragma once
+#ifndef BKMAIL_TESTS_SUPPORT_IO_RUNNER_H_
+#define BKMAIL_TESTS_SUPPORT_IO_RUNNER_H_
+
+#include <bnio/io_context.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <thread>
+#include <utility>
+
+namespace bkmail::test {
+
+/**
+ * Runs a bnio::io_context on a dedicated thread for the object's lifetime.
+ * Mirrors the helper in usage.md §1.3.
+ */
+class io_runner {
+ public:
+  io_runner() : thread_([this] { (void)ioc_.run(); }) {}
+
+  io_runner(const io_runner&) = delete;
+  io_runner& operator=(const io_runner&) = delete;
+
+  ~io_runner() {
+    ioc_.stop();
+    thread_.join();
+  }
+
+  /// The context borrowed by sessions under test.
+  [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
+
+ private:
+  bnio::io_context ioc_;
+  std::thread thread_;
+};
+
+/**
+ * One-shot, count-up cross-thread signal with a bounded wait. Handlers call
+ * arrive() (possibly several times); the test thread blocks in
+ * wait()/wait_for() until at least one arrival was observed.
+ */
+class signal_event {
+ public:
+  /// Records one arrival; never blocks.
+  void arrive() {
+    {
+      std::lock_guard lock(mutex_);
+      ++count_;
+    }
+    cv_.notify_all();
+  }
+
+  /// Blocks until at least one arrival was observed.
+  void wait() {
+    std::unique_lock lock(mutex_);
+    cv_.wait(lock, [this] { return count_ != 0U; });
+  }
+
+  /// Blocks until at least one arrival was observed or the timeout expires;
+  /// returns false on timeout (the test then fails with context).
+  template <class Rep, class Period>
+  [[nodiscard]] bool wait_for(std::chrono::duration<Rep, Period> timeout) {
+    std::unique_lock lock(mutex_);
+    return cv_.wait_for(lock, timeout, [this] { return count_ != 0U; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::size_t count_ = 0;
+};
+
+/**
+ * Bounded busy-wait for conditions that expose no notification (e.g.
+ * is_alive() flipping after a BYE). Returns the predicate's final value.
+ */
+template <class Predicate, class Rep, class Period>
+[[nodiscard]] bool poll_until(Predicate predicate,
+                              std::chrono::duration<Rep, Period> timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return predicate();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
+
+/// Default bound for the scripted exchanges in this test suite; generous so
+/// CI stalls surface as readable failures instead of flaky timeouts.
+inline constexpr std::chrono::milliseconds kDefaultTimeout{10000};
+
+}  // namespace bkmail::test
+
+#endif  // BKMAIL_TESTS_SUPPORT_IO_RUNNER_H_
