@@ -218,10 +218,13 @@ TEST(ErrorPaths, StopTokenCancelsInFlightOperation) {
                       "* OK [UIDVALIDITY 1] valid\r\n"
                       "{tag} OK [READ-WRITE] SELECT completed\r\n"},
           expect_client{"SEARCH"},
-          // Deliberately no tagged reply: the cancelled operation must not
-          // wait for one.
+          // Deliberately no tagged reply, and the connection stays open:
+          // an EOF here would race the cancellation and could complete
+          // the operation on the error channel before the stop is even
+          // requested. With the server silent and connected, the stop
+          // token is the only way this operation can complete.
       },
-      /*close_at_end=*/true);
+      /*close_at_end=*/false);
 
   io_runner runner;
   auto selected = connect_login_select(server, runner.get());
