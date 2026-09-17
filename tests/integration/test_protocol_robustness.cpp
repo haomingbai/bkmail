@@ -71,9 +71,6 @@ namespace bth = bexec::this_thread;
 
 using scripted_context = im::imap_context<scripted_stream>;
 
-constexpr std::string_view kCapabilities =
-    "IMAP4rev1 UIDPLUS MOVE IDLE LITERAL+ SASL-IR";
-
 // architecture §2: "Unknown response codes must be skipped without failing
 // the parse." The greeting, an interleaved untagged OK, and the tagged
 // completion all carry made-up codes here.

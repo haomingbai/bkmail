@@ -87,7 +87,9 @@ namespace bkmail::test {
  */
 struct expect_client {
   std::string substring;
-  std::string forbid;
+  // NSDMI keeps -Wmissing-field-initializers quiet for the many
+  // `expect_client{"..."}` call sites that declare no gate.
+  std::string forbid{};
 };
 
 /**

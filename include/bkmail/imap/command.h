@@ -8,9 +8,9 @@
  * SPDX-License-Identifier: MIT
  *
  * @details
- * Pulls in every imap/command/*.h command type plus the type-erased
- * imap_command handle and make_command. Aggregate header: includes only,
- * no logic.
+ * Pulls in every command type header under imap/command/ plus the
+ * type-erased imap_command handle and make_command. Aggregate header:
+ * includes only, no logic.
  */
 
 #pragma once

@@ -601,7 +601,9 @@ class idle_op_operation {
     // operation state dies) retires the hook; stray pushes until then are
     // dropped by the completed_ guard.
     if (timer_.has_value()) {
-      timer_->cancel();
+      // Return value (number of cancelled waits) is deliberately unused:
+      // an already-fired heartbeat completion is guarded by completed_.
+      (void)timer_->cancel();
     }
     connection_.finish_operation();
   }
