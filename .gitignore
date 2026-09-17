@@ -22,7 +22,7 @@ coverage/
 
 # Exelude Copilot files
 .vscode/
-.github/
+.github/*
 !.github/workflows/
 
 # Exclude vim swap files
