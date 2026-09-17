@@ -6,27 +6,117 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+  build-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.build_type }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
+        compiler: [gcc, clang]
+        exclude:
+          - os: macos-latest
+            compiler: gcc
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # bnio's Linux io_uring backend requires liburing >= 2.1 (probed via
+      # pkg-config) and links OpenSSL on every platform it supports.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev pkg-config libssl-dev
+
+      # FindOpenSSL does not reliably discover Homebrew's keg-only openssl@3;
+      # point it at the prefix explicitly.
+      - name: Locate OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: fetchcontent
+          key: deps-${{ runner.os }}-${{ matrix.compiler }}-${{ hashFiles('cmake/*.cmake') }}
+          restore-keys: deps-${{ runner.os }}-${{ matrix.compiler }}-
+
+      # bexec v0.1.0, bnio v0.2.0 (which fetches nothing further: its asio
+      # resolution is reserved for its own examples/benchmarks), and
+      # googletest v1.17.0 are shallow-cloned from GitHub during configure.
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFETCHCONTENT_BASE_DIR="${{ github.workspace }}/fetchcontent"
 
       - name: Build
-        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        run: cmake --build build --parallel
+
+      # Serial on purpose: the loopback integration tests have timing
+      # windows that degrade under heavy parallel load.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  sanitizers:
+    name: asan+ubsan
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev pkg-config libssl-dev
+
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: fetchcontent
+          key: deps-asan-${{ hashFiles('cmake/*.cmake') }}
+          restore-keys: deps-asan-
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DFETCHCONTENT_BASE_DIR="${{ github.workspace }}/fetchcontent"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build --parallel
 
       - name: Test
-        run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure
+        run: |
+          export ASAN_OPTIONS=detect_stack_use_after_return=1
+          export UBSAN_OPTIONS=print_stacktrace=1
+          ctest --test-dir build --output-on-failure --timeout 240
 
   format-check:
     name: clang-format
@@ -35,14 +125,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install clang-format
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format
+      # Pinned to the exact version the project formats with locally;
+      # Google-style output is not stable across clang-format releases.
+      - name: Install clang-format 22.1.8
+        run: pip3 install clang-format==22.1.8
 
       - name: Check formatting
-        continue-on-error: true
-        run: |
-          find include src tests examples -type f \
-            \( -name '*.h' -o -name '*.hpp' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) \
-            -exec clang-format --dry-run --Werror {} +
+        run: ./scripts/check-format.sh
