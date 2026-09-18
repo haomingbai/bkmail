@@ -357,9 +357,7 @@ class context_core
     // or this abandon() won the mutex and the losing arm unwinds instead
     // of arming. Under every interleaving exactly one side delivers the
     // teardown completion.
-    if constexpr (requires {
-      stream_.complete_pending_io_for_teardown();
-    }) {
+    if constexpr (requires { stream_.complete_pending_io_for_teardown(); }) {
       stream_.complete_pending_io_for_teardown();
     }
     maybe_finish_close();

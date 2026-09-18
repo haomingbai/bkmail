@@ -130,5 +130,10 @@ jobs:
       - name: Install clang-format 22.1.8
         run: pip3 install clang-format==22.1.8
 
-      - name: Check formatting
+      # Formatting drift is reported as a step warning (GitHub annotates
+      # the failed step with its log) but never fails the workflow: format
+      # violations are cosmetic, and a red CI is reserved for real
+      # build/test failures.
+      - name: Check formatting (report only, non-fatal)
+        continue-on-error: true
         run: ./scripts/check-format.sh

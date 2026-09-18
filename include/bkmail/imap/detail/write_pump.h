@@ -92,11 +92,10 @@ class write_pump {
       // so the catch path below still owns the core.
       auto alloc = core->get_allocator();
       auto sender = bexec::schedule(core->scheduler());
-      auto* box = make_io_box(
-          std::move(alloc), std::move(sender),
-          [core](io_box_base* self) mutable {
-            return kick_receiver(self, std::move(core));
-          });
+      auto* box = make_io_box(std::move(alloc), std::move(sender),
+                              [core](io_box_base* self) mutable {
+                                return kick_receiver(self, std::move(core));
+                              });
       box->start();
     } catch (...) {
       // Allocation failure: unlatch so a later submission re-kicks; the
@@ -257,8 +256,7 @@ class write_pump {
       // destroyed silently (handlers dropped, not invoked); during a
       // close() drain they are failed with the cancellation code, like
       // every other queued operation.
-      const bool abandoned =
-          core->abandoned_.load(std::memory_order_acquire);
+      const bool abandoned = core->abandoned_.load(std::memory_order_acquire);
       std::vector<cell_type, rebind_alloc_t<Allocator, cell_type>> retired{
           rebind_alloc_t<Allocator, cell_type>(core->get_allocator())};
       for (auto* op : staged) {

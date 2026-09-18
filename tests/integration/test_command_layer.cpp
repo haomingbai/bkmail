@@ -318,11 +318,10 @@ TEST(CommandLayer, UnsolicitedEventsAreDispatched) {
   // pushes (in-chunk order), so its completion is a deterministic
   // handshake proving the handler observed every push — no polling.
   signal_event noop_done;
-  h.ctx.submit(im::noop_command<>{},
-               [&](std::error_code ec) {
-                 EXPECT_FALSE(ec) << ec.message();
-                 noop_done.arrive();
-               });
+  h.ctx.submit(im::noop_command<>{}, [&](std::error_code ec) {
+    EXPECT_FALSE(ec) << ec.message();
+    noop_done.arrive();
+  });
   h.ctx.flush();
   ASSERT_TRUE(noop_done.wait_for(kDefaultTimeout));
 
@@ -426,11 +425,10 @@ TEST(CommandLayer, CancelPendingIdleSendsDone) {
   // a0001 line (in-chunk order), so its completion is the deterministic
   // handshake proving the withdrawn IDLE handler was never invoked.
   signal_event after_idle;
-  h.ctx.submit(im::noop_command<>{},
-               [&](std::error_code ec) {
-                 EXPECT_FALSE(ec) << ec.message();
-                 after_idle.arrive();
-               });
+  h.ctx.submit(im::noop_command<>{}, [&](std::error_code ec) {
+    EXPECT_FALSE(ec) << ec.message();
+    after_idle.arrive();
+  });
 
   h.ctx.cancel(idle_tag);
 

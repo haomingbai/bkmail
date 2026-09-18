@@ -35,10 +35,10 @@
  * never stores flags, moves, or expunges anything.
  */
 
-#include <bexec/bexec.hpp>
 #include <bkmail/bkmail.h>
 
 #include <atomic>
+#include <bexec/bexec.hpp>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -83,8 +83,7 @@ class io_runner {
   void quiesce() {
     class done_receiver {
      public:
-      explicit done_receiver(std::atomic<bool>& done) noexcept
-          : done_(done) {}
+      explicit done_receiver(std::atomic<bool>& done) noexcept : done_(done) {}
       void set_value(std::error_code) noexcept { done_.store(true); }
       void set_stopped() noexcept { done_.store(true); }
 

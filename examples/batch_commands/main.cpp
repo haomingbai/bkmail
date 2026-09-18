@@ -198,14 +198,13 @@ int main(int argc, char* argv[]) {
           any_failed = true;
           enqueue_line("capability: " + ec.message());
         } else {
-          enqueue_line("capabilities: IDLE=" +
-                       std::to_string(static_cast<int>(caps.contains("IDLE"))) +
-                       " UIDPLUS=" +
-                       std::to_string(static_cast<int>(caps.contains(
-                           "UIDPLUS"))) +
-                       " LITERAL+=" +
-                       std::to_string(static_cast<int>(
-                           caps.contains("LITERAL+"))));
+          enqueue_line(
+              "capabilities: IDLE=" +
+              std::to_string(static_cast<int>(caps.contains("IDLE"))) +
+              " UIDPLUS=" +
+              std::to_string(static_cast<int>(caps.contains("UIDPLUS"))) +
+              " LITERAL+=" +
+              std::to_string(static_cast<int>(caps.contains("LITERAL+"))));
         }
         completions.release();
       }));
@@ -217,8 +216,8 @@ int main(int argc, char* argv[]) {
           enqueue_line("list: " + ec.message());
         } else {
           for (const auto& entry : entries) {
-            enqueue_line("mailbox: " + entry.name +
-                         " (delimiter " + entry.delimiter +
+            enqueue_line("mailbox: " + entry.name + " (delimiter " +
+                         entry.delimiter +
                          (entry.no_select ? ", no-select)" : ")"));
           }
         }

@@ -116,11 +116,11 @@ class read_pump {
     auto alloc = core->get_allocator();
     auto sender = core->stream_.async_read_some(
         core->scheduler(), core->read_buffer_.prepare(kReadChunk), 0);
-    auto* box = make_io_box(
-        std::move(alloc), std::move(sender),
-        [core = std::move(core)](io_box_base* self) mutable {
-          return read_receiver(self, std::move(core));
-        });
+    auto* box =
+        make_io_box(std::move(alloc), std::move(sender),
+                    [core = std::move(core)](io_box_base* self) mutable {
+                      return read_receiver(self, std::move(core));
+                    });
     box->start();
   }
 

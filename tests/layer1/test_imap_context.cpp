@@ -234,11 +234,10 @@ TEST(ImapContext, CancelPendingIdleSendsDoneFirst) {
   // a0001 line (in-chunk order), so its completion is the deterministic
   // handshake proving the withdrawn IDLE handler was never invoked.
   signal_event after_idle;
-  h.ctx.submit(im::noop_command<>{},
-               [&](std::error_code ec) {
-                 EXPECT_FALSE(ec) << ec.message();
-                 after_idle.arrive();
-               });
+  h.ctx.submit(im::noop_command<>{}, [&](std::error_code ec) {
+    EXPECT_FALSE(ec) << ec.message();
+    after_idle.arrive();
+  });
 
   h.ctx.cancel(idle_tag);
 

@@ -208,7 +208,8 @@ struct script_state {
  * Runs one pass of the script engine on the scheduler thread: completes the
  * armed write (if any) and the armed read (if the next step is deliverable).
  */
-inline void drive_script(const std::shared_ptr<script_state>& state) noexcept {  scripted_write_op_base* write_op = nullptr;
+inline void drive_script(const std::shared_ptr<script_state>& state) noexcept {
+  scripted_write_op_base* write_op = nullptr;
   scripted_read_op_base* read_op = nullptr;
   std::error_code write_ec;
   std::error_code read_ec;
