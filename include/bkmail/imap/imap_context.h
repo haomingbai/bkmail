@@ -102,6 +102,22 @@ concept imap_stream = std::move_constructible<S> &&
                       };
 
 /**
+ * Generic scheduler-to-context channel: every `basic_scheduler<Kind>`
+ * (post / dispatch / defer) stores the borrowed io_context pointer and
+ * exposes it through `context()`, so one template serves every handle
+ * kind instead of per-kind retrieval code. Unchecked by design: the
+ * handle comes from a live io_context at construction, and reaching a
+ * null context through it is UB by contract.
+ */
+template <class Scheduler>
+  requires requires(const Scheduler& sched) {
+    { sched.context() } -> std::same_as<bnio::io_context&>;
+  }
+[[nodiscard]] bnio::io_context& io_context_of(const Scheduler& sched) noexcept {
+  return sched.context();
+}
+
+/**
  * Heap-held state of an imap_context (see the imap_context documentation
  * for the lifetime contract). All members are technically public so the
  * friend-scoped pumps can drive them; the type itself is detail-only and
@@ -142,12 +158,16 @@ class context_core
   enum class phase { open, draining, closed };
 
   /**
-   * Takes ownership of @p stream and borrows @p ioc. The read pump is
-   * NOT armed here (a shared_ptr to the core does not exist yet); the
-   * shell arms it right after construction with arm_read().
+   * Takes ownership of @p stream and borrows @p ioc: the post-scheduler
+   * handle stores the context pointer, and the generic template channel
+   * (`io_context_of`) is the way back to the io_context. There is no
+   * ioc-less form and no null state; passing a null context is UB at the
+   * call site. The read pump is NOT armed here (a shared_ptr to the core
+   * does not exist yet); the shell arms it right after construction with
+   * arm_read().
    */
   context_core(Stream stream, bnio::io_context& ioc, const Allocator& alloc)
-      : ioc_(&ioc),
+      : scheduler_(ioc.get_post_scheduler()),
         stream_(std::move(stream)),
         alloc_(alloc),
         registry_(0, string_hash{}, std::equal_to<>{},
@@ -251,13 +271,15 @@ class context_core
   /// Points the context's *next* I/O at @p ioc (architecture §3.6).
   void set_io_context(bnio::io_context& ioc) noexcept {
     std::lock_guard lock(mutex_);
-    ioc_ = &ioc;
+    scheduler_ = ioc.get_post_scheduler();
   }
 
-  /// The context the next I/O initiation borrows.
+  /// The context the next I/O initiation borrows, through the generic
+  /// scheduler channel (`io_context_of`). Unchecked: a null context is
+  /// UB.
   [[nodiscard]] bnio::io_context& io_context() const noexcept {
     std::lock_guard lock(mutex_);
-    return *ioc_;
+    return io_context_of(scheduler_);
   }
 
   // ---- lifecycle -------------------------------------------------------
@@ -616,7 +638,7 @@ class context_core
   /// `mutex_`.
   [[nodiscard]] scheduler_type scheduler() noexcept {
     std::lock_guard lock(mutex_);
-    return ioc_->get_post_scheduler();
+    return scheduler_;
   }
 
   // ---- members ------------------------------------------------------------
@@ -630,8 +652,13 @@ class context_core
   // about concurrent API calls on one context (architecture §6).
   mutable std::recursive_mutex mutex_;
 
-  bnio::io_context* ioc_;  // borrowed; see set_io_context contract
-  Stream stream_;          // owned I/O credential
+  // The borrowed io_context, stored through the post-scheduler handle:
+  // the handle carries the context pointer internally and the generic
+  // channel `io_context_of` is the way back to it. Constructed only from
+  // a live reference, so there is no null state; see set_io_context
+  // contract.
+  scheduler_type scheduler_;
+  Stream stream_;  // owned I/O credential
   [[no_unique_address]] Allocator alloc_;
 
   std::uint64_t tag_counter_ = 1;
@@ -748,6 +775,11 @@ class imap_context {
    * @pre @p stream is already connected.
    * @pre @p ioc outlives this context and has a thread inside `run()`.
    *
+   * There is deliberately no construction without an io_context and no
+   * null-context state: the ioc pointer is stored through the
+   * post-scheduler handle, and calls that reach the context are UB if
+   * that contract is broken.
+   *
    * If arming the first read fails (allocation failure), the context is
    * constructed closed: `is_alive()` returns false.
    */
@@ -764,6 +796,8 @@ class imap_context {
    * Move-constructs the shell: only the shared ownership travels; the
    * underlying state (stream, pumps, registry) keeps its stable address,
    * so a move is legal at any time — even with operations in flight.
+   * A moved-from shell owns no core — hence no io_context — and every
+   * call on it other than destruction is UB.
    */
   imap_context(imap_context&&) noexcept = default;
   imap_context& operator=(imap_context&&) = delete;

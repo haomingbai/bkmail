@@ -376,7 +376,10 @@ allocator-rebound):
   // about concurrent API calls on one context (§6).
   std::mutex mutex_;
 
-  bnio::io_context* ioc_;        // borrowed; see §3.6
+  // borrowed io_context, held through the post-scheduler handle; the
+  // generic template channel io_context_of(sched) is the way back to
+  // the io_context (§3.6)
+  bnio::io_context::post_scheduler scheduler_;
   Stream stream_;                // owned I/O credential
   Allocator alloc_;
 
@@ -839,8 +842,10 @@ event: their consumers are operations, not unsolicited handlers.
 
 ### 3.6 `io_context` borrowing rules
 
-`set_io_context(bnio::io_context&)` stores a pointer used to obtain the
-scheduler for the *next* I/O initiation. Because bnio sockets are
+`set_io_context(bnio::io_context&)` stores the context's post-scheduler
+handle — the handle carries the context pointer, and its `context()` is
+the channel back to the `io_context` — used for the *next* I/O
+initiation. Because bnio sockets are
 unbound and take a scheduler per call (§2.2), borrowing is exact:
 "run the next I/O on that context." The following boundaries are
 contractual:
