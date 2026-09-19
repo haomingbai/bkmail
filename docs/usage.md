@@ -251,7 +251,7 @@ Note the shape that repeats at every step:
 
 `bexec::task` can `co_await` any sender, with one restriction: the awaited
 sender must have at most one value in its value completion. bkmail offers
-two adaptors at the await point (`include/bkmail/pack.h`, re-exported from
+two adaptors at the await point (`include/bkmail/common/pack.h`, re-exported from
 `bkmail/bkmail.h`):
 
 - **single-signature operations** deliver `(error_code, [result,]

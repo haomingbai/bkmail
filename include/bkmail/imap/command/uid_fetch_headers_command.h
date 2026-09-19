@@ -26,13 +26,13 @@
 #ifndef BKMAIL_IMAP_COMMAND_UID_FETCH_HEADERS_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_UID_FETCH_HEADERS_COMMAND_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/error.h>
+#include <bkmail/common/mail_header.h>
 #include <bkmail/imap/detail/astring.h>
 #include <bkmail/imap/detail/fetch_parse.h>
 #include <bkmail/imap/operation_base.h>
 #include <bkmail/imap/response.h>
-#include <bkmail/mail_header.h>
 #include <bnio/buffer/basic.h>
 
 #include <cstddef>

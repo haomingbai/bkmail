@@ -12,8 +12,10 @@
 #ifndef BKMAIL_IMAP_STATE_SELECTED_H_
 #define BKMAIL_IMAP_STATE_SELECTED_H_
 
-#include <bkmail/envelope.h>
-#include <bkmail/error.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/error.h>
+#include <bkmail/common/mail.h>
+#include <bkmail/common/mail_header.h>
 #include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/command/capability_command.h>
 #include <bkmail/imap/command/close_command.h>
@@ -46,8 +48,6 @@
 #include <bkmail/imap/state/detail/state_op_sender.h>
 #include <bkmail/imap/state/logout.h>
 #include <bkmail/imap/unsolicited_event.h>
-#include <bkmail/mail.h>
-#include <bkmail/mail_header.h>
 
 #include <cstdint>
 #include <memory>

@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/envelope.h
+ * @file include/bkmail/common/envelope.h
  * @brief IMAP ENVELOPE structure.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,11 +9,11 @@
  */
 
 #pragma once
-#ifndef BKMAIL_ENVELOPE_H_
-#define BKMAIL_ENVELOPE_H_
+#ifndef BKMAIL_COMMON_ENVELOPE_H_
+#define BKMAIL_COMMON_ENVELOPE_H_
 
-#include <bkmail/address.h>
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/address.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <memory>
 
@@ -57,4 +57,4 @@ struct envelope {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_ENVELOPE_H_
+#endif  // BKMAIL_COMMON_ENVELOPE_H_

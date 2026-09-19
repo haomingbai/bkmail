@@ -12,6 +12,7 @@
 #ifndef BKMAIL_IMAP_STATE_AUTHENTICATED_H_
 #define BKMAIL_IMAP_STATE_AUTHENTICATED_H_
 
+#include <bkmail/common/mail.h>
 #include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/command/append_command.h>
 #include <bkmail/imap/command/capability_command.h>
@@ -34,7 +35,6 @@
 #include <bkmail/imap/state/detail/state_op_sender.h>
 #include <bkmail/imap/state/logout.h>
 #include <bkmail/imap/state/selected.h>
-#include <bkmail/mail.h>
 
 #include <memory>
 #include <string_view>

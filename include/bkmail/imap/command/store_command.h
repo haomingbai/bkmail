@@ -28,8 +28,8 @@
 #ifndef BKMAIL_IMAP_COMMAND_STORE_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_STORE_COMMAND_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/fetch_items.h>
 #include <bkmail/imap/flags.h>
 #include <bkmail/imap/operation_base.h>

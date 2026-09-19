@@ -12,9 +12,9 @@
 #ifndef BKMAIL_IMAP_MESSAGE_ATTRIBUTES_H_
 #define BKMAIL_IMAP_MESSAGE_ATTRIBUTES_H_
 
-#include <bkmail/body_structure.h>
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/envelope.h>
+#include <bkmail/common/body_structure.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/envelope.h>
 #include <bkmail/imap/flags.h>
 
 #include <cstddef>

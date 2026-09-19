@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_RAW_RESPONSE_H_
 #define BKMAIL_IMAP_RAW_RESPONSE_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <memory>
 

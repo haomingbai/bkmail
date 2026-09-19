@@ -12,8 +12,8 @@
 #ifndef BKMAIL_IMAP_STATE_NOT_AUTHENTICATED_H_
 #define BKMAIL_IMAP_STATE_NOT_AUTHENTICATED_H_
 
-#include <bkmail/account_info.h>
-#include <bkmail/error.h>
+#include <bkmail/common/account_info.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/command/authenticate_command.h>
 #include <bkmail/imap/command/capability_command.h>

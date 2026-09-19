@@ -47,7 +47,7 @@
 #ifndef BKMAIL_IMAP_DETAIL_READ_PUMP_H_
 #define BKMAIL_IMAP_DETAIL_READ_PUMP_H_
 
-#include <bkmail/error.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/detail/response_lexer.h>
 #include <bkmail/imap/detail/response_parser.h>
 #include <bkmail/imap/operation_base.h>

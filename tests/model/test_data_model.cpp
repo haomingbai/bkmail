@@ -9,13 +9,13 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <bkmail/account_info.h>
-#include <bkmail/address.h>
-#include <bkmail/body_structure.h>
-#include <bkmail/envelope.h>
-#include <bkmail/mail.h>
-#include <bkmail/mail_body.h>
-#include <bkmail/mail_header.h>
+#include <bkmail/common/account_info.h>
+#include <bkmail/common/address.h>
+#include <bkmail/common/body_structure.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/mail.h>
+#include <bkmail/common/mail_body.h>
+#include <bkmail/common/mail_header.h>
 #include <gtest/gtest.h>
 
 #include <cstddef>

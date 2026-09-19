@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_STATE_IDLE_H_
 #define BKMAIL_IMAP_STATE_IDLE_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/imap/detail/unsolicited_table.h>
 #include <bkmail/imap/imap_connection.h>
 #include <bkmail/imap/mailbox_info.h>

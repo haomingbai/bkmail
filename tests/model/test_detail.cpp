@@ -9,9 +9,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/detail/unique_function.h>
-#include <bkmail/pack.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/detail/unique_function.h>
+#include <bkmail/common/pack.h>
 #include <gtest/gtest.h>
 
 #include <bexec/just.hpp>

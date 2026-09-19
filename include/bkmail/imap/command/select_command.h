@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_COMMAND_SELECT_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_SELECT_COMMAND_H_
 
-#include <bkmail/error.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/flags.h>
 #include <bkmail/imap/mailbox_info.h>
 #include <bkmail/imap/response.h>

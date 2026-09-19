@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/error.h
+ * @file include/bkmail/common/error.h
  * @brief bkmail error codes and error category.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,8 +9,8 @@
  */
 
 #pragma once
-#ifndef BKMAIL_ERROR_H_
-#define BKMAIL_ERROR_H_
+#ifndef BKMAIL_COMMON_ERROR_H_
+#define BKMAIL_COMMON_ERROR_H_
 
 #include <bkmail/export.h>
 
@@ -58,4 +58,4 @@ struct is_error_code_enum<bkmail::errc> : true_type {};
 
 }  // namespace std
 
-#endif  // BKMAIL_ERROR_H_
+#endif  // BKMAIL_COMMON_ERROR_H_

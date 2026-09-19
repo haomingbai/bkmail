@@ -12,8 +12,8 @@
 #ifndef BKMAIL_IMAP_COMMAND_LOGIN_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_LOGIN_COMMAND_H_
 
-#include <bkmail/account_info.h>
-#include <bkmail/error.h>
+#include <bkmail/common/account_info.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/response.h>
 #include <bnio/buffer/basic.h>
 

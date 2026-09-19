@@ -21,15 +21,15 @@
 #include <bexec/bexec.hpp>
 
 // Core: errors, credentials, mail data model, sender helpers.
-#include <bkmail/account_info.h>
-#include <bkmail/address.h>
-#include <bkmail/body_structure.h>
-#include <bkmail/envelope.h>
-#include <bkmail/error.h>
-#include <bkmail/mail.h>
-#include <bkmail/mail_body.h>
-#include <bkmail/mail_header.h>
-#include <bkmail/pack.h>
+#include <bkmail/common/account_info.h>
+#include <bkmail/common/address.h>
+#include <bkmail/common/body_structure.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/error.h>
+#include <bkmail/common/mail.h>
+#include <bkmail/common/mail_body.h>
+#include <bkmail/common/mail_header.h>
+#include <bkmail/common/pack.h>
 
 // IMAP facility (layers 1+2 and the imap-scoped model types) and the
 // session connect entry points.

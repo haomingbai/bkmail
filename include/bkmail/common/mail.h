@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/mail.h
+ * @file include/bkmail/common/mail.h
  * @brief Complete mail message composition.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,12 +9,12 @@
  */
 
 #pragma once
-#ifndef BKMAIL_MAIL_H_
-#define BKMAIL_MAIL_H_
+#ifndef BKMAIL_COMMON_MAIL_H_
+#define BKMAIL_COMMON_MAIL_H_
 
-#include <bkmail/envelope.h>
-#include <bkmail/mail_body.h>
-#include <bkmail/mail_header.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/mail_body.h>
+#include <bkmail/common/mail_header.h>
 
 #include <memory>
 #include <optional>
@@ -39,4 +39,4 @@ struct mail {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_MAIL_H_
+#endif  // BKMAIL_COMMON_MAIL_H_

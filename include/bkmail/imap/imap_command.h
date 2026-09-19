@@ -26,7 +26,7 @@
 #ifndef BKMAIL_IMAP_IMAP_COMMAND_H_
 #define BKMAIL_IMAP_IMAP_COMMAND_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/imap/operation_base.h>
 
 #include <cstddef>

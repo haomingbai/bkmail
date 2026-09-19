@@ -27,9 +27,9 @@
 #ifndef BKMAIL_IMAP_COMMAND_UID_FETCH_ENVELOPES_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_UID_FETCH_ENVELOPES_COMMAND_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/envelope.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/detail/fetch_parse.h>
 #include <bkmail/imap/operation_base.h>
 #include <bkmail/imap/response.h>

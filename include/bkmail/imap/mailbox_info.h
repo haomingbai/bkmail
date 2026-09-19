@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_MAILBOX_INFO_H_
 #define BKMAIL_IMAP_MAILBOX_INFO_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/imap/flags.h>
 
 #include <cstdint>

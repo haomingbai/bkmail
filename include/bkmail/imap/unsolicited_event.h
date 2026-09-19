@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_UNSOLICITED_EVENT_H_
 #define BKMAIL_IMAP_UNSOLICITED_EVENT_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/flags.h>
 #include <bkmail/imap/response.h>

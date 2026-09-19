@@ -33,15 +33,15 @@
 #ifndef BKMAIL_IMAP_DETAIL_FETCH_PARSE_H_
 #define BKMAIL_IMAP_DETAIL_FETCH_PARSE_H_
 
-#include <bkmail/address.h>
-#include <bkmail/body_structure.h>
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/envelope.h>
+#include <bkmail/common/address.h>
+#include <bkmail/common/body_structure.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/envelope.h>
+#include <bkmail/common/mail_header.h>
 #include <bkmail/imap/detail/astring.h>
 #include <bkmail/imap/detail/response_parser.h>
 #include <bkmail/imap/flags.h>
 #include <bkmail/imap/message_attributes.h>
-#include <bkmail/mail_header.h>
 
 #include <cstdint>
 #include <optional>

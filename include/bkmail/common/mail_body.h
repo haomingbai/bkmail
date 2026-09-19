@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/mail_body.h
+ * @file include/bkmail/common/mail_body.h
  * @brief Owning message body with content metadata.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,10 +9,10 @@
  */
 
 #pragma once
-#ifndef BKMAIL_MAIL_BODY_H_
-#define BKMAIL_MAIL_BODY_H_
+#ifndef BKMAIL_COMMON_MAIL_BODY_H_
+#define BKMAIL_COMMON_MAIL_BODY_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <cstddef>
 #include <memory>
@@ -43,4 +43,4 @@ struct mail_body {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_MAIL_BODY_H_
+#endif  // BKMAIL_COMMON_MAIL_BODY_H_

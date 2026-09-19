@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_COMMAND_DELETE_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_DELETE_COMMAND_H_
 
-#include <bkmail/error.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/response.h>
 #include <bnio/buffer/basic.h>
 

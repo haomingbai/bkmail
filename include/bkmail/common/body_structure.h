@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/body_structure.h
+ * @file include/bkmail/common/body_structure.h
  * @brief MIME BODYSTRUCTURE tree node.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,10 +9,10 @@
  */
 
 #pragma once
-#ifndef BKMAIL_BODY_STRUCTURE_H_
-#define BKMAIL_BODY_STRUCTURE_H_
+#ifndef BKMAIL_COMMON_BODY_STRUCTURE_H_
+#define BKMAIL_COMMON_BODY_STRUCTURE_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <cstdint>
 #include <memory>
@@ -58,4 +58,4 @@ struct body_structure {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_BODY_STRUCTURE_H_
+#endif  // BKMAIL_COMMON_BODY_STRUCTURE_H_

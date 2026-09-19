@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_CAPABILITY_SET_H_
 #define BKMAIL_IMAP_CAPABILITY_SET_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/export.h>
 
 #include <cstddef>

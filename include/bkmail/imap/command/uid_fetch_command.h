@@ -27,8 +27,8 @@
 #ifndef BKMAIL_IMAP_COMMAND_UID_FETCH_COMMAND_H_
 #define BKMAIL_IMAP_COMMAND_UID_FETCH_COMMAND_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/detail/fetch_parse.h>
 #include <bkmail/imap/fetch_items.h>
 #include <bkmail/imap/message_attributes.h>

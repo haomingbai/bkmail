@@ -27,8 +27,8 @@
 #ifndef BKMAIL_IMAP_STATE_DETAIL_STATE_OP_SENDER_H_
 #define BKMAIL_IMAP_STATE_DETAIL_STATE_OP_SENDER_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/command/idle_command.h>
 #include <bkmail/imap/detail/unsolicited_table.h>
 #include <bkmail/imap/imap_connection.h>

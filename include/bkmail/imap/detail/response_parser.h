@@ -12,7 +12,7 @@
 #ifndef BKMAIL_IMAP_DETAIL_RESPONSE_PARSER_H_
 #define BKMAIL_IMAP_DETAIL_RESPONSE_PARSER_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/imap/detail/astring.h>
 #include <bkmail/imap/detail/parse_cursor.h>
 #include <bkmail/imap/flags.h>

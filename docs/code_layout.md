@@ -14,6 +14,17 @@ module graph; §3 is the complete file tree with per-file contents and the
 §5 is the naming master table (the implementation contract); §6 is the
 CMake plan; §7 is the parallel-implementation batching plan.
 
+**Migration note (2026-09-19):** the general-purpose headers have moved
+from the `include/bkmail/` root into `include/bkmail/common/` —
+`address.h`, `envelope.h`, `body_structure.h`, `mail_header.h`,
+`mail_body.h`, `mail.h`, `account_info.h`, `pack.h`, `error.h` — and the
+former top-level `detail/` directory into
+`include/bkmail/common/detail/` (`allocator_ext.h`, `unique_function.h`).
+Namespaces are unchanged; only file locations moved. The affected
+sections (§2, §3.1/§3.1a, §3.6, §6) below have been updated accordingly.
+§7 is the historical implementation plan and is kept as written, so its
+file lists still use the pre-move paths.
+
 ## 1. Reconciliation decisions
 
 `architecture.md` and `usage.md` were written in parallel and diverge on
@@ -192,8 +203,8 @@ Concrete mapping:
 
 | Module | Namespace | Directory |
 | --- | --- | --- |
-| core | `bkmail` | `include/bkmail/` root files |
-| model | `bkmail`, `bkmail::imap` | `include/bkmail/` root + `include/bkmail/imap/` value headers |
+| core | `bkmail` | `include/bkmail/` root files (`export.h`, `version.h`) |
+| model | `bkmail`, `bkmail::imap` | `include/bkmail/common/` + `include/bkmail/imap/` value headers |
 | proto | `bkmail::imap::detail` | `include/bkmail/imap/detail/` |
 | layer1 | `bkmail::imap` (+`detail`) | `include/bkmail/imap/`, `include/bkmail/imap/command/`, `include/bkmail/imap/detail/` |
 | layer2 | `bkmail::imap`, `bkmail` (free functions) | `include/bkmail/imap/state/`, `include/bkmail/imap/imap_connection.h`, `include/bkmail/connect.h` |
@@ -213,10 +224,16 @@ capability interning helpers that must not be inlined into every TU).
 Template-heavy code being in headers is a consequence of the allocator
 policy, not a choice to review.
 
-`include/bkmail/detail/` holds cross-module template helpers that are not
-public API: `unique_function.h` and `allocator_ext.h` (rebound
-string/vector aliases). `pack.h` (`bkmail::pack`) sits at the
-`include/bkmail/` root — it is public API, re-exported from `bkmail.h`.
+`include/bkmail/common/` holds the general-purpose, IMAP-independent
+headers shared across modules: the data-model types (`account_info.h`,
+`address.h`, `envelope.h`, `body_structure.h`, `mail_header.h`,
+`mail_body.h`, `mail.h`), the error codes (`error.h`), and the `pack`
+adaptor (`pack.h`, `bkmail::pack` — public API, re-exported from
+`bkmail.h`). `include/bkmail/common/detail/` holds cross-module template
+helpers that are not public API: `unique_function.h` and
+`allocator_ext.h` (rebound string/vector aliases). The module `core`
+(`export.h`, `version.h`) and the IMAP facility stay under
+`include/bkmail/`.
 
 ## 3. File tree
 
@@ -229,24 +246,32 @@ public header is its exact `@brief` content — implementation agents copy it
 verbatim (date: day of authorship, author: Haoming Bai
 \<haomingbai@hotmail.com\>).
 
-### 3.1 `include/bkmail/` — core + data model
+### 3.1 `include/bkmail/` — core, connect entry, and aggregate headers
 
 | File | Kind | Contents |
 | --- | --- | --- |
 | `export.h` | [H] (exists) | `BKMAIL_EXPORT` macro family. Unchanged. brief: *Export macros for bkmail.* |
 | `version.h` | [H+CPP] (exists) | `bkmail::version()`. Unchanged. brief: *Version information for bkmail.* |
-| `error.h` | [H+CPP] | `bkmail::errc`, `bkmail::error_category()`, `make_error_code`, `is_error_code_enum` specialization. brief: *bkmail error codes and error category.* |
-| `account_info.h` | [H] | `account_info<Allocator>` (`user_name`, `password`, `authzid` optional). brief: *IMAP account credentials carrier.* |
-| `address.h` | [H] | `address<Allocator>` (`display_name`, `adl`, `mailbox_name`, `host_name`, `email()`). brief: *RFC 3501 address tuple.* |
-| `envelope.h` | [H] | `envelope<Allocator>` (10 ENVELOPE fields). brief: *IMAP ENVELOPE structure.* |
-| `body_structure.h` | [H] | `body_structure<Allocator>` (recursive MIME tree). brief: *MIME BODYSTRUCTURE tree node.* |
-| `mail_header.h` | [H] | `mail_header<Allocator>` + MIME decoding entry points (RFC 2047 encoded-word decoding as `detail` inline helpers declared here). brief: *Structured RFC 5322 header view with MIME decoding.* |
-| `mail_body.h` | [H] | `mail_body<Allocator>`. brief: *Owning message body with content metadata.* |
-| `mail.h` | [H] | `mail<Allocator>` (`header`, `body`, optional `envelope`). brief: *Complete mail message composition.* |
-| `pack.h` | [H] | `bkmail::pack` adaptor (tuple-packing `bexec::then` wrapper). brief: *Packs multi-value sender completions into one tuple for co_await.* |
 | `connect.h` | [H] | `bkmail::async_connect`, `bkmail::async_connect_tls`. brief: *IMAP session connect entry points.* |
 | `imap.h` | [AGG] | includes every header of §3.2 + §3.3 + §3.4. brief: *Aggregate header for the bkmail IMAP facility.* |
-| `bkmail.h` | [AGG] (exists) | adds includes of the above; keeps bnio/bexec umbrella includes. brief: *Aggregate header for the entire bkmail library.* |
+| `bkmail.h` | [AGG] (exists) | adds includes of the above and of §3.1a; keeps bnio/bexec umbrella includes. brief: *Aggregate header for the entire bkmail library.* |
+
+### 3.1a `include/bkmail/common/` — general-purpose data model + error + pack
+
+Moved here from the `include/bkmail/` root on 2026-09-19 (see the
+migration note at the top); namespaces unchanged.
+
+| File | Kind | Contents |
+| --- | --- | --- |
+| `common/error.h` | [H+CPP] | `bkmail::errc`, `bkmail::error_category()`, `make_error_code`, `is_error_code_enum` specialization. brief: *bkmail error codes and error category.* |
+| `common/account_info.h` | [H] | `account_info<Allocator>` (`user_name`, `password`, `authzid` optional). brief: *IMAP account credentials carrier.* |
+| `common/address.h` | [H] | `address<Allocator>` (`display_name`, `adl`, `mailbox_name`, `host_name`, `email()`). brief: *RFC 3501 address tuple.* |
+| `common/envelope.h` | [H] | `envelope<Allocator>` (10 ENVELOPE fields). brief: *IMAP ENVELOPE structure.* |
+| `common/body_structure.h` | [H] | `body_structure<Allocator>` (recursive MIME tree). brief: *MIME BODYSTRUCTURE tree node.* |
+| `common/mail_header.h` | [H] | `mail_header<Allocator>` + MIME decoding entry points (RFC 2047 encoded-word decoding as `detail` inline helpers declared here). brief: *Structured RFC 5322 header view with MIME decoding.* |
+| `common/mail_body.h` | [H] | `mail_body<Allocator>`. brief: *Owning message body with content metadata.* |
+| `common/mail.h` | [H] | `mail<Allocator>` (`header`, `body`, optional `envelope`). brief: *Complete mail message composition.* |
+| `common/pack.h` | [H] | `bkmail::pack` adaptor (tuple-packing `bexec::then` wrapper). brief: *Packs multi-value sender completions into one tuple for co_await.* |
 
 ### 3.2 `include/bkmail/imap/` — model types + Layer 1 + Layer 2
 
@@ -342,12 +367,12 @@ sharing a file would read as one type with a flag — rejected).
 | `detail/read_pump.h` | `detail::read_pump<Stream, Allocator>`: permanent `async_read_some` loop, lexer drive, dispatch into registry + unsolicited table. |
 | `detail/submit_sender.h` | `detail::submit_sender` / `detail::submit_operation`: the sender half of `imap_context::submit<Operation>(args...)`, templated on the context type so the include direction stays one-way. |
 
-### 3.6 `include/bkmail/detail/` — cross-module helpers (all [H] [detail])
+### 3.6 `include/bkmail/common/detail/` — cross-module helpers (all [H] [detail])
 
 | File | Contents |
 | --- | --- |
-| `detail/unique_function.h` | `detail::unique_function<R(Args...)>` minimal move-only function wrapper (handler storage). |
-| `detail/allocator_ext.h` | `detail::rebind_alloc_t`, `detail::string_of<Allocator>`, `detail::vector_of<T, Allocator>` aliases used across modules. |
+| `common/detail/unique_function.h` | `detail::unique_function<R(Args...)>` minimal move-only function wrapper (handler storage). |
+| `common/detail/allocator_ext.h` | `detail::rebind_alloc_t`, `detail::string_of<Allocator>`, `detail::vector_of<T, Allocator>` aliases used across modules. |
 
 ### 3.7 `src/`
 
@@ -571,7 +596,9 @@ form (D9).
 - **`include/CMakeLists.txt`: unchanged.** The family convention is
   `file(GLOB_RECURSE ... CONFIGURE_DEPENDS)` over `bkmail/*.h` (identical in
   bnio); new subdirectories (`imap/`, `imap/command/`, …) are picked up
-  automatically. Keep it.
+  automatically. The `common/` directory (and `common/detail/`) added by
+  the 2026-09-19 header migration is covered by the same glob — no
+  CMake edit was needed for it. Keep it.
 - **`src/CMakeLists.txt`: explicit source list, family-style.** Replace
   `target_sources(bkmail PRIVATE version.cpp ${BKMAIL_PUBLIC_HEADERS})`
   with an explicit list variable:

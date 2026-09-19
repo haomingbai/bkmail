@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/pack.h
+ * @file include/bkmail/common/pack.h
  * @brief Packs multi-value sender completions into one tuple for co_await.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,8 +9,8 @@
  */
 
 #pragma once
-#ifndef BKMAIL_PACK_H_
-#define BKMAIL_PACK_H_
+#ifndef BKMAIL_COMMON_PACK_H_
+#define BKMAIL_COMMON_PACK_H_
 
 #include <bexec/then.hpp>
 #include <tuple>
@@ -57,4 +57,4 @@ inline constexpr pack_t pack{};
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_PACK_H_
+#endif  // BKMAIL_COMMON_PACK_H_

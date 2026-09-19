@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/mail_header.h
+ * @file include/bkmail/common/mail_header.h
  * @brief Structured RFC 5322 header view with MIME decoding.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,11 +9,11 @@
  */
 
 #pragma once
-#ifndef BKMAIL_MAIL_HEADER_H_
-#define BKMAIL_MAIL_HEADER_H_
+#ifndef BKMAIL_COMMON_MAIL_HEADER_H_
+#define BKMAIL_COMMON_MAIL_HEADER_H_
 
-#include <bkmail/address.h>
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/address.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <cctype>
 #include <cstddef>
@@ -203,4 +203,4 @@ struct mail_header {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_MAIL_HEADER_H_
+#endif  // BKMAIL_COMMON_MAIL_HEADER_H_

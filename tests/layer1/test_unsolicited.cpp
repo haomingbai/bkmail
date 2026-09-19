@@ -11,7 +11,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <bkmail/error.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/imap_context.h>
 #include <bkmail/imap/unsolicited_event.h>
 #include <gtest/gtest.h>

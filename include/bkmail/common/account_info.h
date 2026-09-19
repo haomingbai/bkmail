@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/account_info.h
+ * @file include/bkmail/common/account_info.h
  * @brief IMAP account credentials carrier.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,10 +9,10 @@
  */
 
 #pragma once
-#ifndef BKMAIL_ACCOUNT_INFO_H_
-#define BKMAIL_ACCOUNT_INFO_H_
+#ifndef BKMAIL_COMMON_ACCOUNT_INFO_H_
+#define BKMAIL_COMMON_ACCOUNT_INFO_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <memory>
 #include <optional>
@@ -42,4 +42,4 @@ struct account_info {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_ACCOUNT_INFO_H_
+#endif  // BKMAIL_COMMON_ACCOUNT_INFO_H_

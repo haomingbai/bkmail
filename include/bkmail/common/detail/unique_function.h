@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/detail/unique_function.h
+ * @file include/bkmail/common/detail/unique_function.h
  * @brief Minimal move-only function wrapper for handler storage.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,8 +9,8 @@
  */
 
 #pragma once
-#ifndef BKMAIL_DETAIL_UNIQUE_FUNCTION_H_
-#define BKMAIL_DETAIL_UNIQUE_FUNCTION_H_
+#ifndef BKMAIL_COMMON_DETAIL_UNIQUE_FUNCTION_H_
+#define BKMAIL_COMMON_DETAIL_UNIQUE_FUNCTION_H_
 
 #include <cassert>
 #include <cstddef>
@@ -130,4 +130,4 @@ void swap(unique_function<R(Args...)>& a,
 
 }  // namespace bkmail::detail
 
-#endif  // BKMAIL_DETAIL_UNIQUE_FUNCTION_H_
+#endif  // BKMAIL_COMMON_DETAIL_UNIQUE_FUNCTION_H_

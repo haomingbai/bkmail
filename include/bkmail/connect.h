@@ -19,8 +19,8 @@
 #ifndef BKMAIL_CONNECT_H_
 #define BKMAIL_CONNECT_H_
 
-#include <bkmail/detail/allocator_ext.h>
-#include <bkmail/error.h>
+#include <bkmail/common/detail/allocator_ext.h>
+#include <bkmail/common/error.h>
 #include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/command/capability_command.h>
 #include <bkmail/imap/detail/unsolicited_table.h>

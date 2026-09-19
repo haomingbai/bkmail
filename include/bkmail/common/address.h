@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/address.h
+ * @file include/bkmail/common/address.h
  * @brief RFC 3501 address tuple.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,10 +9,10 @@
  */
 
 #pragma once
-#ifndef BKMAIL_ADDRESS_H_
-#define BKMAIL_ADDRESS_H_
+#ifndef BKMAIL_COMMON_ADDRESS_H_
+#define BKMAIL_COMMON_ADDRESS_H_
 
-#include <bkmail/detail/allocator_ext.h>
+#include <bkmail/common/detail/allocator_ext.h>
 
 #include <memory>
 
@@ -55,4 +55,4 @@ struct address {
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_ADDRESS_H_
+#endif  // BKMAIL_COMMON_ADDRESS_H_

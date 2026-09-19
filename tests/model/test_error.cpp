@@ -8,7 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <bkmail/error.h>
+#include <bkmail/common/error.h>
 #include <gtest/gtest.h>
 
 #include <string>

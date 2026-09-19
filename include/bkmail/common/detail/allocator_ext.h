@@ -1,5 +1,5 @@
 /**
- * @file include/bkmail/detail/allocator_ext.h
+ * @file include/bkmail/common/detail/allocator_ext.h
  * @brief Allocator rebinding aliases shared across modules.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -9,8 +9,8 @@
  */
 
 #pragma once
-#ifndef BKMAIL_DETAIL_ALLOCATOR_EXT_H_
-#define BKMAIL_DETAIL_ALLOCATOR_EXT_H_
+#ifndef BKMAIL_COMMON_DETAIL_ALLOCATOR_EXT_H_
+#define BKMAIL_COMMON_DETAIL_ALLOCATOR_EXT_H_
 
 #include <memory>
 #include <string>
@@ -34,4 +34,4 @@ using vector_of = std::vector<T, rebind_alloc_t<Allocator, T>>;
 
 }  // namespace bkmail::detail
 
-#endif  // BKMAIL_DETAIL_ALLOCATOR_EXT_H_
+#endif  // BKMAIL_COMMON_DETAIL_ALLOCATOR_EXT_H_
