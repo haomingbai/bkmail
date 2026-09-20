@@ -373,6 +373,19 @@ class connect_operation {
       return;
     }
     stop_callback_.reset();
+    // Disown the in-flight CAPABILITY probe before delivering: its handler
+    // captures `this`, and the completion lets the consumer destroy this
+    // operation state while the worker is still unwinding (the BYE path
+    // completes inside the greeting dispatch). A cell left registered would
+    // let a racing connection_lost invoke that handler on freed memory —
+    // observed on macOS CI as a second sync_wait completion (double
+    // run_loop::finish()). cancel() extracts or detaches the cell so its
+    // reply/failure is handled without touching `this`; the callback-path
+    // stop-completion it may post never invokes the handler.
+    if (connection_ && !tag_.empty()) {
+      connection_->with_context(
+          [tag = tag_](auto& ctx) mutable { ctx.cancel(tag); });
+    }
     // greeting_registration_ is deliberately NOT reset here: complete()
     // may run inside the unsolicited greeting handler itself (the BYE
     // path), and destroying a registration from within its own dispatch is
