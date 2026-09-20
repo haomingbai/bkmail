@@ -35,7 +35,6 @@
 #include <bkmail/imap/imap_connection.h>
 #include <bkmail/imap/session_state.h>
 #include <bkmail/imap/state/authenticated.h>
-#include <bkmail/imap/state/idle.h>
 #include <bkmail/imap/state/logout.h>
 #include <bkmail/imap/state/not_authenticated.h>
 #include <bkmail/imap/state/selected.h>

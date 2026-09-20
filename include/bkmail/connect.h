@@ -157,13 +157,17 @@ class connect_operation {
         op->stop_requested_.store(true, std::memory_order_release);
         return;
       }
-      if (op->completed_.exchange(true, std::memory_order_acq_rel)) {
+      if (op->completed_->exchange(true, std::memory_order_acq_rel)) {
         return;
       }
       op->greeting_registration_.reset();
       op->connection_->with_context(
           [tag = op->tag_](auto& ctx) mutable { ctx.cancel(tag); });
-      bexec::set_stopped(std::move(op->receiver_));
+      op->stop_callback_.reset();
+      // §6 contract: the receiver is completed from the context's
+      // dispatch path, never inline on the requesting thread.
+      imap::detail::post_stopped_delivery(op->alloc_, *op->ioc_, op->receiver_,
+                                          op->completed_);
     }
   };
 
@@ -212,19 +216,13 @@ class connect_operation {
   using handshake_op = decltype(bexec::connect(
       std::declval<handshake_sender>(), std::declval<handshake_receiver>()));
 
-  using env_type = decltype(bexec::get_env(std::declval<const Receiver&>()));
-  using stop_token_type =
-      decltype(bexec::get_stop_token(std::declval<const env_type&>()));
-  using stop_callback =
-      typename stop_token_type::template callback_type<stop_forwarder>;
-
   /// Delivers the latched stop request, if any. Returns true when the
   /// operation is finished and the phase callback must bail out.
   bool deliver_latched_stop() noexcept {
     if (!stop_requested_.load(std::memory_order_acquire)) {
       return false;
     }
-    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+    if (!completed_->exchange(true, std::memory_order_acq_rel)) {
       stop_callback_.reset();
       bexec::set_stopped(std::move(receiver_));
     }
@@ -371,7 +369,7 @@ class connect_operation {
   /// failure (DNS/connect/TLS before the greeting, or a BYE greeting)
   /// completes with the terminal logout_state alongside the error code.
   void complete(std::error_code ec) noexcept {
-    if (completed_.exchange(true, std::memory_order_acq_rel)) {
+    if (completed_->exchange(true, std::memory_order_acq_rel)) {
       return;
     }
     stop_callback_.reset();
@@ -416,10 +414,12 @@ class connect_operation {
       tcp_connect_op_;
   std::optional<bexec::detail::pass_through_operation<handshake_op>>
       handshake_op_;
-  std::optional<stop_callback> stop_callback_;
+  imap::detail::stop_callback_box<Receiver, stop_forwarder> stop_callback_;
   std::atomic<phase> phase_ = phase::resolve;
   std::atomic<bool> stop_requested_ = false;
-  std::atomic<bool> completed_ = false;
+  // Shared so the posted stopped-delivery task can hold a flag copy.
+  std::shared_ptr<std::atomic<bool>> completed_ =
+      std::make_shared<std::atomic<bool>>(false);
   greeting_kind greeting_ = greeting_kind::ok;  // ioc-thread domain
   bool greeting_seen_ = false;                  // ioc-thread domain
 };

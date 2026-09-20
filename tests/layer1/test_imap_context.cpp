@@ -17,6 +17,7 @@
 #include <support/scripted_stream.h>
 
 #include <atomic>
+#include <bexec/bexec.hpp>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -37,6 +38,7 @@ using bkmail::test::expect_write;
 using bkmail::test::kDefaultTimeout;
 using bkmail::test::kLayer1Greeting;
 using bkmail::test::poll_until;
+using bkmail::test::quiesce_guard;
 using bkmail::test::script;
 using bkmail::test::scripted_context;
 using bkmail::test::server_bytes;
@@ -213,7 +215,10 @@ TEST(ImapContext, CancelWrittenCommandDropsLateResponse) {
 }
 
 // Cancellation granularity 3 (code_layout D3): cancelling a pending IDLE
-// sends DONE first so the server stays in sync.
+// sends DONE first so the server stays in sync. The cancel here lands at
+// an intentionally uncontrolled phase (before or after the "+ idling"
+// dispatch); both interleavings of a second cancel pass are pinned
+// deterministically by the SecondCancelPassKeepsQueuedDoneOnWire test.
 TEST(ImapContext, CancelPendingIdleSendsDoneFirst) {
   context_holder h({
       server_bytes{std::string(kLayer1Greeting)},
@@ -246,6 +251,89 @@ TEST(ImapContext, CancelPendingIdleSendsDoneFirst) {
   ASSERT_TRUE(after_idle.wait_for(kDefaultTimeout));
   EXPECT_EQ(0, idle_calls.load())
       << "a cancelled handler is withdrawn, never invoked";
+}
+
+// Regression pin for the CI failure
+// IdleUnsolicited.IdleCancelSendsDoneAndCompletesStopped: a second cancel
+// pass arriving while the queued DONE was not yet staged (phase
+// done_pending) used to extract the operation cell in detach_locked, so
+// the DONE never reached the wire and the IDLE handshake stalled. The
+// deciding interleaving is client-internal — no wire evidence can force
+// it, which is why the integration test cannot reproduce it — so it is
+// pinned here at layer 1 over the scripted stream. Both cancel passes
+// fire from one request_stop() executed ON the io worker (run_on_worker):
+// the first pass queues DONE and posts the pump kick BEHIND the running
+// task, so the second pass observes done_pending-not-staged with no pump
+// interleaving in between. The detach_locked contract: an operation is
+// never extracted once any of its bytes reached the wire, so the second
+// pass falls through to the idempotent cancel_written() and the DONE is
+// still written.
+TEST(ImapContext, SecondCancelPassKeepsQueuedDoneOnWire) {
+  context_holder h({
+      server_bytes{std::string(kLayer1Greeting)},
+      expect_write{"a0001 IDLE"},
+      server_bytes{"+ idling\r\n"},
+      expect_write{"DONE\r\n"},
+      server_bytes{"a0001 OK IDLE terminated\r\n"},
+  });
+
+  // Receiver shape of the state layer's idle operation (usage.md §2.7):
+  // the stop token rides in the environment; cancellation completes with
+  // set_stopped and never through the error code.
+  class idle_receiver {
+   public:
+    using env_type = bexec::env_with_stop_token<>;
+
+    idle_receiver(bexec::inplace_stop_token token, signal_event& stopped,
+                  std::atomic<int>& value_calls)
+        : env_(token), stopped_(&stopped), value_calls_(&value_calls) {}
+
+    env_type get_env() const noexcept { return env_; }
+
+    void set_value(std::error_code) noexcept { ++(*value_calls_); }
+
+    void set_stopped() noexcept { stopped_->arrive(); }
+
+   private:
+    env_type env_;
+    signal_event* stopped_;
+    std::atomic<int>* value_calls_;
+  };
+
+  signal_event stopped;
+  std::atomic<int> value_calls{0};
+  bexec::inplace_stop_source stop_src;
+  auto operation =
+      bexec::connect(h.ctx.submit<im::idle_command<>>(),
+                     idle_receiver{stop_src.get_token(), stopped, value_calls});
+  bexec::start(operation);
+  // Covers every early return below: the io worker must have left all
+  // receiver call chains before the stack operation state is destroyed.
+  quiesce_guard teardown{h.runner};
+
+  // start() ran attach(), which registered the production stop callback
+  // (callback #1 of the production pair).
+  ASSERT_TRUE(h.recorder.wait_written("a0001 IDLE", kDefaultTimeout));
+  // Drive barrier: the read dispatch of "+ idling" has run, so the
+  // command is deterministically in the idling phase.
+  h.runner.quiesce();
+
+  // Callback #2 of the production pair: a second cancel pass on the same
+  // operation (the tag is deterministic: this is the fixture's first
+  // submission).
+  bexec::inplace_stop_callback second_pass{stop_src.get_token(),
+                                           [&] { h.ctx.cancel("a0001"); }};
+
+  // request_stop() ON the io worker pins the interleaving by queue order:
+  // pass 1 queues DONE and posts the pump kick behind the running task,
+  // so pass 2 sees the cell in done_pending-not-staged.
+  h.runner.run_on_worker([&] { stop_src.request_stop(); });
+
+  ASSERT_TRUE(h.recorder.wait_written("DONE\r\n", kDefaultTimeout))
+      << "the second cancel pass must not extract the cell while the "
+         "queued DONE is unstaged (detach_locked contract)";
+  ASSERT_TRUE(stopped.wait_for(kDefaultTimeout));
+  EXPECT_EQ(0, value_calls.load());
 }
 
 // Type erasure (usage.md §3.4): make_command erases heterogeneous commands

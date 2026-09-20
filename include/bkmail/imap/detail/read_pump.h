@@ -33,10 +33,11 @@
  *  - untagged: first the unsolicited table (whole-variant event), then
  *    every registered operation's `on_untagged` under the context lock
  *    (command-internal code only, never user code).
- *  - continuation: routed to the single `continuation_target_`; a
- *    continuation with no waiter is a protocol violation and fails the
- *    connection. After the target renders its literal bytes the write
- *    pump is kicked.
+ *  - continuation: routed to the single `continuation_target_` (which
+ *    write_pump::kick registers at staging time, before any response to
+ *    the staged bytes can be dispatched); a continuation with no waiter
+ *    is a protocol violation and fails the connection. After the target
+ *    renders its literal bytes the write pump is kicked.
  *
  * An untagged BYE is connection-fatal but not immediately: the server
  * may still deliver a pending tagged reply (LOGOUT). The pump records
@@ -107,21 +108,20 @@ class read_pump {
       core->maybe_finish_close();
       return;
     }
-    // Materialize the allocator and the sender before the receiver
-    // factory: capturing `core` by move initializes the lambda as an
-    // argument of the same call, and with an unspecified argument
-    // evaluation order the other arguments would dereference a
-    // moved-from (null) shared_ptr. Both also re-enter the core mutex,
-    // which the recursive lock permits.
-    auto alloc = core->get_allocator();
-    auto sender = core->stream_.async_read_some(
-        core->scheduler(), core->read_buffer_.prepare(kReadChunk), 0);
-    auto* box =
-        make_io_box(std::move(alloc), std::move(sender),
-                    [core = std::move(core)](io_box_base* self) mutable {
-                      return read_receiver(self, std::move(core));
-                    });
-    box->start();
+    // start_io_box materializes the sender before the receiver factory
+    // runs (the sequencing hazard the wrapper exists for). The receiver
+    // factory copy-captures `core` and moves at invocation time: an
+    // init-capture move would already run at this call site, before
+    // make_sender dereferences the pump's shared_ptr.
+    start_io_box(
+        core->get_allocator(),
+        [&core] {
+          return core->stream_.async_read_some(
+              core->scheduler(), core->read_buffer_.prepare(kReadChunk), 0);
+        },
+        [core](io_box_base* self) mutable {
+          return read_receiver(self, std::move(core));
+        });
   }
 
  private:
@@ -136,17 +136,30 @@ class read_pump {
     void set_value(std::error_code ec, std::size_t n) noexcept {
       io_box_base* box = box_;
       core_type* core = core_.get();
-      const bool abandoned = core->abandoned_.load(std::memory_order_acquire);
-      if (!abandoned) {
-        on_read(*core, ec, n);
-      } else {
-        // Shell destroyed (usage.md §7.4): no dispatch, no handlers —
-        // only the pump bookkeeping so the close protocol can finish.
-        // (maybe_finish_close takes the mutex itself; call it unlocked.)
-        {
-          std::lock_guard lock(core->mutex_);
+      // The teardown-vs-dispatch decision is made under the core mutex,
+      // serialized with abandon()/close() exactly like the arm paths
+      // (the recursive mutex re-enters fine when an eagerly-completed
+      // read reaches this from arm()). Loading `abandoned_` unlocked
+      // was a check-then-act race: the flag and the phase it gates are
+      // only coherent together under the lock.
+      bool dispatch;
+      {
+        std::lock_guard lock(core->mutex_);
+        dispatch = !core->abandoned_.load(std::memory_order_acquire) &&
+                   core->phase_ != core_type::phase::closed;
+        if (!dispatch) {
+          // Shell destroyed (usage.md §7.4): no dispatch, no handlers —
+          // only the pump bookkeeping so the close protocol can finish.
           core->read_running_ = false;
         }
+      }
+      if (dispatch) {
+        // on_read manages its own locking; a draining context still
+        // reaches its error path, which is what fails the written
+        // operations the close protocol promised to fail.
+        on_read(*core, ec, n);
+      } else {
+        // (maybe_finish_close takes the mutex itself; call it unlocked.)
         core->maybe_finish_close();
       }
       core_.reset();
@@ -253,16 +266,21 @@ class read_pump {
   }
 
   /// tagged: route to the registered operation; detached tags drop. A
-  /// cell whose segment is staged in the in-flight write is NOT extracted
-  /// here — the write still references it; it is marked detached and
-  /// retired by the write completion instead (its handler/receiver still
-  /// runs now, exactly once; the operation_model's delivery guard makes
-  /// the later stop-completion a no-op).
+  /// tagged reply ALWAYS takes ownership of its cell first — the cell
+  /// is extracted from the queue and the registry under the mutex,
+  /// whether or not the command's own bytes are still being written —
+  /// and `on_tagged` runs outside the lock. Safety: the in-flight write
+  /// references only the staging BYTES (`write_staging_`), never the
+  /// cell; `on_write_done` re-validates every staged pointer against
+  /// the queue (`queue_contains_locked`) and skips extracted cells, so
+  /// no flush callback touches an operation already handed to its
+  /// completion, and `arm()`'s teardown path goes through
+  /// `extract_from_queue_locked`, which returns null for
+  /// already-extracted ops.
   static bool dispatch_one(core_type& ctx,
                            tagged_response<Allocator>&& response) {
     using cell_type = typename core_type::cell_type;
     cell_type cell;
-    operation_type* staged_op = nullptr;
     {
       std::lock_guard lock(ctx.mutex_);
       auto it = ctx.registry_.find(response.tag);
@@ -275,18 +293,7 @@ class read_pump {
       if (ctx.continuation_target_ == op) {
         ctx.continuation_target_ = nullptr;
       }
-      if (op->is_staged()) {
-        op->mark_detached();
-        staged_op = op;
-      } else {
-        cell = ctx.extract_from_queue_locked(op);
-      }
-    }
-    if (staged_op != nullptr) {
-      // Ownership stays in the queue (the write pump retires the cell);
-      // the completion itself is delivered now, on the dispatch path.
-      staged_op->on_tagged(std::move(response));
-      return true;
+      cell = ctx.extract_from_queue_locked(op);
     }
     if (cell == nullptr) {
       // Registry/queue divergence is an internal invariant violation.
@@ -344,7 +351,10 @@ class read_pump {
     }
   }
 
-  /// continuation: single route to the paused operation.
+  /// continuation: single route to the paused operation. The route is
+  /// registered at STAGING time (write_pump::kick), so a `+` answering
+  /// bytes whose write completion has not been reaped yet still finds
+  /// its waiter; a missing waiter is a protocol violation.
   static bool dispatch_one(core_type& ctx,
                            continuation_request<Allocator>&& response) {
     operation_type* target;

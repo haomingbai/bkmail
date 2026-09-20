@@ -185,9 +185,7 @@ class selected_state {
   /// MOVE messages (UIDPLUS). Fails immediately with
   /// errc::capability_required when the server lacks MOVE.
   [[nodiscard]] auto move(std::string_view seq, std::string_view mailbox) && {
-    return detail::state_op_sender{std::move(connection_),
-                                   move_command<Allocator>{seq, mailbox},
-                                   take_snapshot(), "MOVE"};
+    return same_state_op(move_command<Allocator>{seq, mailbox}, "MOVE");
   }
 
   /// EXPUNGE: permanently removes \Deleted messages.
@@ -269,23 +267,14 @@ class selected_state {
   /// errc::capability_required when the server lacks MOVE.
   [[nodiscard]] auto uid_move(std::string_view seq,
                               std::string_view mailbox) && {
-    return detail::state_op_sender{std::move(connection_),
-                                   uid_move_command<Allocator>{seq, mailbox},
-                                   take_snapshot(), "MOVE"};
+    return same_state_op(uid_move_command<Allocator>{seq, mailbox}, "MOVE");
   }
 
   /// CAPABILITY probe; refreshes the connection's capability cache.
   [[nodiscard]] auto capability() && {
     return detail::state_op_sender{
         std::move(connection_), capability_command<Allocator>{},
-        [snapshot = take_snapshot()](std::error_code ec,
-                                     imap_connection<Allocator> conn,
-                                     capability_set<Allocator> caps) mutable {
-          if (!ec) {
-            conn.set_capabilities(caps);
-          }
-          return std::pair{std::move(caps), snapshot(ec, std::move(conn))};
-        }};
+        detail::capability_successor<Allocator>(take_snapshot())};
   }
 
   /// NOOP (protocol keep-alive).
@@ -295,14 +284,9 @@ class selected_state {
 
   /// LOGOUT: the connection is torn down; yields the terminal state.
   [[nodiscard]] auto logout() && {
-    return detail::state_op_sender{
-        std::move(connection_), logout_command<Allocator>{},
-        [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-          // The completion runs inside the read dispatch; the connection's
-          // destruction is detained to after the dispatch unwinds.
-          detail::detain_connection(std::move(conn));
-          return logout_state<Allocator>{};
-        }};
+    return detail::state_op_sender{std::move(connection_),
+                                   logout_command<Allocator>{},
+                                   detail::logout_successor<Allocator>()};
   }
 
  private:
@@ -328,11 +312,14 @@ class selected_state {
   }
 
   /// Helper for void-result operations whose successor is this same state.
+  /// @p required_capability fails the operation fast (without touching the
+  /// wire) when the server lacks the extension (e.g. UIDPLUS MOVE).
   /// Only called from &&-qualified operations, which own the connection.
   template <class Command>
-  [[nodiscard]] auto same_state_op(Command command) {
+  [[nodiscard]] auto same_state_op(Command command,
+                                   std::string_view required_capability = {}) {
     return detail::state_op_sender{std::move(connection_), std::move(command),
-                                   take_snapshot()};
+                                   take_snapshot(), required_capability};
   }
 
   /// Helper for resultful operations whose successor is this same state.

@@ -24,7 +24,7 @@ mail data model:
 +------------------------------------------------------------------+
 | Layer 2 — session state machine            (namespace bkmail::imap) |
 |   not_authenticated_state   authenticated_state   selected_state |
-|   logout_state              idle_state          imap_connection  |
+|   logout_state              imap_connection                       |
 |   StateA::operationA(args...) &&  ->  Sender                     |
 |   completion: one set_value signature per successor state —      |
 |   set_value(std::error_code, [result,] next_state), never a      |
@@ -174,7 +174,10 @@ IMAP protocol facts the design relies on (RFC 3501 unless noted):
   decimal counter (`a0001`, ...).
 - §5.5 restricts pipelining around ambiguous/sequencing-sensitive commands;
   bkmail's policy: never pipeline across literals, SASL, STARTTLS, or IDLE
-  (§3.4, §10).
+  (§3.4, §10). For IDLE the Layer-1 wall is the `+ idling` continuation
+  wait only; once the server is idling, keeping the connection exclusive
+  is the command-layer caller's responsibility (documented on
+  `idle_command`), while the state layer enforces it by construction.
 - Unsolicited `EXISTS`, `RECENT`, `EXPUNGE`, `FETCH (FLAGS)`, `BYE` may
   arrive while no command is in flight (`EXPUNGE` excepted); `EXPUNGE`
   renumbers all later sequence numbers.
@@ -294,15 +297,21 @@ class imap_context {
   /// queued when the worker runs share the syscall).
   void flush();
 
-  /// Three-granularity cancellation (code_layout D3, §3.7):
-  ///  - queued, not yet written: removed from queue and registry; the
+  /// Cancels one operation (code_layout D3, §3.7). Cancel a tag at
+  /// most once:
+  ///  - queued, never on the wire: removed from queue and registry; the
   ///    completion carries stop semantics — no bytes ever hit the wire;
-  ///  - written, awaiting its tagged reply: completed with stop
-  ///    semantics and detached; the reply is dropped on arrival, the
-  ///    connection stays usable;
-  ///  - a pending idle_command sends DONE first (its tagged reply still
-  ///    completes the operation, with stop semantics).
-  /// The completion runs on the context's dispatch path, never inline.
+  ///  - once ANY byte was staged to the wire the operation can no
+  ///    longer be extracted (the write queue keeps it): a written
+  ///    idle_command re-enters done() (idempotent) so DONE is queued,
+  ///    every other operation is rendered detached and its tagged reply
+  ///    is dropped on arrival; the connection stays usable. DONE
+  ///    delivery to the wire is asynchronous and requires a live
+  ///    io_context.
+  /// The completion runs on the context's dispatch path, never inline
+  /// (one documented fallback: when allocating the scheduler box fails,
+  /// context_core::post_complete_stopped completes inline as a last
+  /// resort, §6).
   /// On the CALLBACK path a cancelled operation never invokes its
   /// handler at all ("cancel withdraws a handler", usage.md §3.3).
   void cancel(std::string_view tag);
@@ -371,10 +380,11 @@ Internal state of `context_core` (member names indicative; all
 allocator-rebound):
 
 ```cpp
-  // Coherence lock. Presence is documented here so implementers know
+  // Coherence lock (mutable std::recursive_mutex: the arm paths
+  // re-enter). Presence is documented here so implementers know
   // the invariant set; bkmail makes NO public thread-safety promise
   // about concurrent API calls on one context (§6).
-  std::mutex mutex_;
+  mutable std::recursive_mutex mutex_;
 
   // borrowed io_context, held through the post-scheduler handle; the
   // generic template channel io_context_of(sched) is the way back to
@@ -404,8 +414,11 @@ allocator-rebound):
   bool write_in_flight_ = false;
   bool kick_posted_ = false;
 
-  // The single operation currently paused on a continuation request
-  // (literal / SASL), if any.
+  // The single operation paused on a continuation request (literal /
+  // SASL), if any. Recorded when a segment awaiting a continuation is
+  // STAGED (under this mutex), not when the write completes — a server
+  // continuation can never arrive un-routed regardless of I/O
+  // completion ordering.
   detail::operation_base<Allocator>* continuation_target_ = nullptr;
 
   // Read side.
@@ -503,8 +516,10 @@ class operation_base {
   /// True once every byte is written and the operation only awaits
   /// server replies ("in flight").
   virtual bool is_written() const noexcept = 0;
-  /// True while a segment is staged but not yet flushed (the in-flight
-  /// write still references the cell; never extract it).
+  /// True while a segment is staged but not yet flushed. Tagged
+  /// dispatch extracts the cell under the context mutex even while
+  /// staged (§3.5); the flush bookkeeping touches only cells still
+  /// resident in the queue.
   virtual bool is_staged() const noexcept = 0;
 
   // --- read side ---------------------------------------------------
@@ -531,14 +546,18 @@ class operation_base {
   /// to the sink; never completes the receiver inline.
   virtual void request_stop() noexcept = 0;
   /// Completes the stored receiver/handler with set_stopped()
-  /// semantics, from the context's dispatch path.
+  /// semantics, from the context's dispatch path. One documented
+  /// fallback: when allocating the scheduler box fails,
+  /// context_core::post_complete_stopped completes inline as a last
+  /// resort.
   virtual void complete_stopped() noexcept = 0;
   /// Registration race guard: true (once) when a stop request arrived
   /// before the operation became visible to the context.
   virtual bool take_stop_request() noexcept = 0;
-  /// Cancel request against an already-written operation. Returns true
-  /// when the operation handled it (IDLE queued DONE and awaits its
-  /// tagged reply); false selects detach/drop-on-arrival.
+  /// Cancel request against an operation already staged to the wire.
+  /// Returns true when the operation handled it (IDLE re-enters
+  /// done() and awaits its tagged reply); false selects detach /
+  /// drop-on-arrival.
   virtual bool cancel_written() noexcept = 0;
   /// Marks the operation detached: its tagged reply is dropped on
   /// arrival and the write pump retires the cell after the in-flight
@@ -663,6 +682,9 @@ kick (on scheduler):
         if op->awaits_continuation(): STOP       // literal/SASL wall
         else: CONTINUE                           // nothing to send this round
       staging.append(seg); op->on_segment_staged()
+      if op->awaits_continuation(): continuation_target_ = op
+                 // routed at staging time, under the lock (§3.5):
+                 // the server's "+ ..." can never arrive un-routed
       if op->awaits_continuation() or op->blocks_pipeline(): STOP
                  // staged the {n} line, or a pipeline-blocking command
                  // (AUTHENTICATE / LOGOUT / STARTTLS)
@@ -788,10 +810,10 @@ lazily in the consuming operation / data layer (`imap/detail/parse_cursor.h`
 
 | Response | Routed to |
 | --- | --- |
-| tagged | `registry_[tag]->on_tagged(...)`; erase from registry; destroy the cell after the handler returns (ownership is moved out of the queue before the virtual call, so the object outlives its own completion). An unknown tag is a detached (cancelled) operation whose reply is dropped on arrival. |
+| tagged | the cell is extracted from the queue AND the registry under the context mutex, then `registry_[tag]->on_tagged(...)` runs on the owned cell — always, including a cell whose staged write has not flushed yet (there is no staged-cell-delivered-unlocked special case; the write completion no longer retires dispatched cells). The cell is destroyed after the handler returns, so the operation outlives its own completion. An unknown tag is a detached (cancelled) operation whose reply is dropped on arrival. |
 | untagged, connection scope | First the unsolicited table (one whole-variant event per registered handler), then **broadcast** to every registered operation's `on_untagged(r)`. This covers the status kinds (`OK`/`NO`/`BAD`/`PREAUTH`/`BYE`), the connection events (`EXISTS`/`RECENT`/`EXPUNGE`), and unknown/extension kinds. |
 | untagged, command scope | First the unsolicited table (when the kind has an event counterpart), then **FIFO attribution**: the line is delivered to the earliest-queued operation whose `wants_untagged(kind)` accepts it, and to no one else. This covers `FETCH`, `LIST`, `LSUB`, `STATUS`, `SEARCH`, `CAPABILITY` data lines and `FLAGS`. (IMAP puts no tag on untagged data; the server completes pipelined commands in submission order in practice, so the earliest waiter is the only honest owner.) |
-| continuation | `continuation_target_` (the single operation paused on it); if none, treat as protocol violation per RFC and fail the connection. After the target renders its literal bytes the write pump is kicked. |
+| continuation | `continuation_target_` (the single operation paused on it); if none, treat as protocol violation per RFC and fail the connection. After the target renders its literal bytes the write pump is kicked. The target is recorded when its segment is staged — under the context mutex, not on write completion — so a continuation can never arrive un-routed regardless of I/O completion ordering. |
 
 Tagged replies may complete **out of order** when commands are pipelined
 (RFC 3501 §5.5 permits a server to finish independent commands in any
@@ -863,25 +885,30 @@ contractual:
 5. **`steady_timer` is context-bound at construction** (§2.7): watchdog and
    IDLE heartbeat timers are recreated lazily from the *current* context
    after every switch, and `set_io_context` during IDLE is a precondition
-   violation (§9).
+   violation (§9) — documented but not runtime-enforced; no check exists
+   today.
 
 ### 3.7 Cancellation and teardown
 
 Stop tokens cannot retract an armed read (§2.6); bkmail therefore offers
 three granularities:
 
-- **Queued, not yet written:** removed from `write_queue_` and
+- **Queued, never on the wire:** removed from `write_queue_` and
   `registry_`; the receiver completes with `set_stopped()` (token-driven)
   — no bytes ever hit the wire.
-- **Written, awaiting tagged reply:** the command cannot be unsent.
-  `request_stop()` completes the receiver with `set_stopped()` promptly
-  and marks the operation detached: when its tagged reply arrives it is
+- **Any byte staged to the wire:** the operation can no longer be
+  extracted; the write queue keeps it. For every command except IDLE the
+  operation is marked detached: its receiver completes with
+  `set_stopped()` promptly and, when the tagged reply arrives, it is
   silently dropped. The connection stays usable. (This is the only honest
   semantic for per-command cancel in IMAP.)
-- **Written IDLE:** `cancel` forwards to the command's `done()`; the
-  `DONE` segment is queued and flushed, and the tagged reply that answers
-  it completes the operation with stop semantics — the server stays in
-  sync.
+- **Staged IDLE:** `cancel` re-enters the command's `done()`
+  (idempotent); the `DONE` segment is queued and flushed, and the tagged
+  reply that answers it completes the operation with stop semantics — the
+  server stays in sync. DONE delivery to the wire is asynchronous and
+  requires a live `io_context`.
+
+Cancel a tag at most once.
 
 On the **callback path** a cancelled operation's handler is never invoked
 (there is no stopped channel to report through; "cancel withdraws a
@@ -890,7 +917,8 @@ with `set_stopped()`.
 
 **Connection level:** `close()` runs the close protocol: (1) stop
 accepting submissions; (2) `stream_.lowest_layer().shutdown(SHUT_RD)` to
-make the armed read complete promptly; (3) fail queued operations
+make the armed read complete promptly; (3) fail queued, never-written
+operations on the calling thread with `std::errc::operation_canceled`
 (written ones are failed when the read side dies); (4) when the read pump
 and any in-flight write have completed, close the descriptor. Closing the
 fd *while* a kernel operation references it is forbidden: a recycled fd
@@ -912,7 +940,9 @@ token; when that stop wins the race, a payload-less sender completes
 `set_value(std::errc::timed_out)`, while a payload-carrying sender (e.g. a
 Layer-2 state operation, whose retained state died with the stopped inner
 operation) completes `set_stopped()` — the timeout verdict cannot
-fabricate a state. This is also the watchdog for hung servers.
+fabricate a state. No operation uses the adaptor today: zero call sites
+exist in the tree, and `detail::with_timeout` is a reserved adaptor, not
+an active watchdog.
 
 ### 3.8 Error model
 
@@ -1065,7 +1095,7 @@ from state to state (the state chain is the session's ownership flow);
 every operation consumes its state by rvalue and delivers the successor
 state for the observed server outcome through its sender — **one
 `set_value` signature per successor state, never a merged variant
-payload** (code_layout D9). `imap/session_state.h` carries only the five
+payload** (code_layout D9). `imap/session_state.h` carries only the four
 forward declarations:
 
 ```cpp
@@ -1075,7 +1105,6 @@ template <class Allocator> class not_authenticated_state;
 template <class Allocator> class authenticated_state;
 template <class Allocator> class selected_state;
 template <class Allocator> class logout_state;       // terminal
-template <class Allocator> class idle_state;         // RFC 2177, §9
 
 }  // namespace bkmail::imap
 ```
@@ -1235,7 +1264,7 @@ full table:
 | Operation(s) | `set_value` signatures (all plus `set_stopped()`) |
 | --- | --- |
 | `async_connect` / `async_connect_tls` | `(ec, not_authenticated_state)` — `OK` greeting · `(ec, authenticated_state)` — `PREAUTH` greeting · `(ec, logout_state)` — `BYE` greeting (`ec == errc::server_bye`) or any pre-greeting failure (DNS / TCP connect / TLS handshake) |
-| `login` / `authenticate` / `authenticate_oauth2` | `(ec, authenticated_state)` — OK · `(ec, not_authenticated_state)` — NO/BAD or transport failure: the *retained* current state over the live connection |
+| `login` / `authenticate` / `authenticate_oauth2` | `(ec, authenticated_state)` — OK · `(ec, not_authenticated_state)` — NO/BAD or transport failure: the *retained* current state |
 | `select` / `examine` | `(ec, selected_state)` — OK (the `mailbox_info` snapshot is absorbed into the state) · `(ec, authenticated_state)` — NO/failure (RFC 3501: a failed SELECT selects no mailbox) |
 | `start_tls` | `(ec, not_authenticated_state)` — single signature; over TLS on success |
 | `close` | `(ec, authenticated_state)` |
@@ -1291,10 +1320,16 @@ callers who need the connection torn down call
   context; to re-affinitize, repost through the user's own scheduler
   (`bexec::starts_on`).
 - `bexec::inplace_stop_callback` may invoke a cancellation callback on the
-  requesting thread; Layer-1 `request_stop` implementations therefore only
-  set flags/erase queue cells under `mutex_` and complete receivers from
-  the context's own dispatch path, never inline from `request_stop`
-  (deadlock avoidance; receiver completion can run arbitrary user code).
+  requesting thread; no receiver is ever completed on that thread. The
+  discipline is uniform across the library: Layer-1 `request_stop`
+  implementations only set flags/erase queue cells under `mutex_`, and
+  Layer-2 (state layer/connect) stop completions are likewise posted
+  through the `io_context` scheduler — receivers are completed only from
+  the `io_context`'s dispatch paths, never inline on the thread that
+  requested the stop (deadlock avoidance; receiver completion can run
+  arbitrary user code). One documented fallback: when allocating the
+  scheduler box fails, `context_core::post_complete_stopped` completes
+  inline as a last resort.
 
 ## 7. Allocator policy
 
@@ -1379,20 +1414,16 @@ Two paths, both ending at the same Layer-1/2 machinery:
 - **Heartbeat:** the operation arms a `bnio::steady_timer` created from
   the connection's **current** `io_context` at IDLE entry (timers are
   context-bound at construction, §2.7). `set_io_context` during IDLE is a
-  precondition violation (§3.6.5).
-- For command-layer audiences that drive `idle_command` manually, the
-  persistent handle is `idle_state<Allocator>` (`imap/state/idle.h`): it
-  wraps a session whose `idle_command` is already in flight and offers
-  only `on_event(f)` (register the push callback), `done() &&` (send
-  DONE; the sender completes with
-  `set_value(std::error_code, selected_state)` once the DONE write is
-  queued — the idle command's tagged reply is discarded on arrival), and
-  `stop()` (send DONE and leave the handle spent; no state is handed
-  back). Destroying the handle without `done()`/`stop()` ends IDLE
-  politely (DONE) before the connection is torn down.
-- Mutual exclusion with the command queue is structural: IDLE is a Layer-2
-  facility, and Layer 2 is serial; Layer-1 users driving IDLE manually via
-  `idle_command` must observe the same exclusivity themselves
+  precondition violation (§3.6.5) — documented but not runtime-enforced;
+  no check exists today.
+- Command-layer audiences drive `idle_command` directly: submit it, let
+  the server's `+ idling` continuation route it, and end the cycle with
+  `cancel(tag)`, which queues DONE (§3.7); the tagged reply that answers
+  the DONE completes the operation with stop semantics.
+- Mutual exclusion with the command queue is structural on the state
+  layer: IDLE is a Layer-2 facility and Layer 2 is serial; Layer-1 users
+  driving `idle_command` must observe the same exclusivity themselves —
+  once the server is idling, nothing else may be written to the socket
   (documented on the command).
 
 ## 10. Risks, limitations, and compensations
@@ -1403,7 +1434,7 @@ Two paths, both ending at the same Layer-1/2 machinery:
 | No per-operation cancellation of armed I/O | three-granularity model: queue-cell removal, drop-on-arrival detach, `shutdown(SHUT_RD)` / close protocol, watchdog timers (§3.7). |
 | No `strand` | internal mutex for coherence across worker hops; explicit *no public thread-safety* contract (§6). |
 | No `any_sender` / `move_only_function` | self-built intrusive `operation_base` erasure (§3.3) and a self-built move-only function wrapper for handler tables. |
-| RFC 3501 §5.5 pipelining ambiguities | Layer 1 permits pipelining except across literal/SASL/STARTTLS/IDLE boundaries, which form hard serialization walls in the write pump (§3.4); Layer 2 is strictly serial (§5.3). |
+| RFC 3501 §5.5 pipelining ambiguities | Layer 1 permits pipelining except across literal/SASL/STARTTLS boundaries and the `+ idling` continuation wait, which form hard serialization walls in the write pump (§3.4); once the server is idling, exclusivity is the command-layer caller's responsibility (documented on `idle_command`), and Layer 2 is strictly serial (§5.3). |
 | fd reuse race | closing a descriptor while a kernel completion still references it can alias a recycled fd. The close protocol drains pumps before `close()` (§3.7). Destroying the `imap_context` shell is always safe: the shell/core split (§3.2a) keeps the stream alive until both pumps have gone quiet and drops pending handlers without invoking them. |
 | Buffer stability | write staging never reallocates mid-write; queue cells are `unique_ptr`; read storage is only `prepare`d when no read is armed (§3.4, §3.5, §2.5). |
 | SIGPIPE | every write passes `MSG_NOSIGNAL`; bnio does not set it (§2.14). |
@@ -1459,7 +1490,7 @@ Layer 2 (`namespace bkmail::imap`, entry points in `bkmail`):
 `imap/state/selected.h`, `imap/state/logout.h`, `imap/state/idle.h`,
 `imap/state/detail/state_op_sender.h` (state_op_sender + idle_op_sender,
 one coupled group), `imap/session_state.h` (forward declarations of the
-five states), `connect.h` (async_connect / async_connect_tls).
+four states), `connect.h` (async_connect / async_connect_tls).
 
 Data model (`namespace bkmail`): `account_info.h`, `address.h`,
 `envelope.h`, `body_structure.h`, `mail_header.h` (+

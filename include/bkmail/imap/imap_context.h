@@ -243,18 +243,9 @@ class context_core
       if (phase_ != phase::open) {
         return;
       }
-      auto it = registry_.find(tag);
-      if (it == registry_.end()) {
-        return;
-      }
-      cell = detach_locked(it, kick);
+      cell = find_and_detach_locked(tag, nullptr, kick);
     }
-    if (kick) {
-      kick_write_pump();
-    }
-    if (cell != nullptr) {
-      post_complete_stopped(std::move(cell));
-    }
+    finish_cancellation(std::move(cell), kick);
   }
 
   // ---- unsolicited responses ------------------------------------------
@@ -307,19 +298,19 @@ class context_core
       }
       phase_ = phase::draining;
       (void)stream_.lowest_layer().shutdown(SHUT_RD);
-      for (auto it = write_queue_.begin(); it != write_queue_.end();) {
-        if (!(*it)->is_written() && !(*it)->is_staged()) {
-          // Never-written cells fail now; staged cells are retired by
-          // the in-flight write's completion, written cells when the
-          // read side dies (promptly, due to SHUT_RD).
-          if (const auto reg = registry_.find((*it)->tag());
-              reg != registry_.end()) {
-            registry_.erase(reg);
-          }
-          pending.push_back(std::move(*it));
-          it = write_queue_.erase(it);
-        } else {
-          ++it;
+      // No server response can matter anymore: drop the continuation
+      // route so no stale target survives the drain.
+      continuation_target_ = nullptr;
+      // Never-written cells fail now; staged cells are retired by
+      // the in-flight write's completion, written cells when the
+      // read side dies (promptly, due to SHUT_RD).
+      take_cells_locked(pending, [](const cell_type& cell) {
+        return !cell->is_written() && !cell->is_staged();
+      });
+      for (auto& cell : pending) {
+        if (const auto reg = registry_.find(cell->tag());
+            reg != registry_.end()) {
+          registry_.erase(reg);
         }
       }
     }
@@ -349,18 +340,15 @@ class context_core
       }
       abandoned_.store(true, std::memory_order_release);
       (void)stream_.lowest_layer().shutdown(SHUT_RD);
+      // No dispatch can follow (the read completion switches to its
+      // quiet form): drop the continuation route.
+      continuation_target_ = nullptr;
       // Never-written and written cells are dropped silently; staged
       // cells are still referenced by the in-flight write and are
       // retired (silently) by its completion.
       registry_.clear();
-      for (auto it = write_queue_.begin(); it != write_queue_.end();) {
-        if ((*it)->is_staged()) {
-          ++it;
-          continue;
-        }
-        dropped.push_back(std::move(*it));
-        it = write_queue_.erase(it);
-      }
+      take_cells_locked(
+          dropped, [](const cell_type& cell) { return !cell->is_staged(); });
     }
     // Cell destruction runs user receiver destructors; outside the lock,
     // and never through a completion (dropped, not invoked).
@@ -472,8 +460,8 @@ class context_core
   }
 
   /// Detach-or-DONE for one registry entry (caller holds `mutex_`):
-  ///  - queued, never on the wire: extracted for a posted stop-
-  ///    completion — no bytes ever hit the wire;
+  ///  - never staged any bytes to the wire: extracted for a posted
+  ///    stop-completion — the server never saw the command;
   ///  - a written or mid-handshake operation that handles cancellation
   ///    itself (IDLE) stays registered and sets @p kick so its DONE
   ///    segment is flushed;
@@ -485,7 +473,8 @@ class context_core
   ///    retires it (stop completion) at the flush that writes it out.
   cell_type detach_locked(typename registry_type::iterator it, bool& kick) {
     operation_type* op = it->second;
-    if (!op->is_written() && !op->is_staged() && !op->awaits_continuation()) {
+    if (!op->has_written() && !op->is_written() && !op->is_staged() &&
+        !op->awaits_continuation()) {
       cell_type cell = extract_from_queue_locked(op);
       registry_.erase(it);
       return cell;
@@ -516,6 +505,22 @@ class context_core
     return nullptr;
   }
 
+  /// Splices every queued cell satisfying @p pred out of the write
+  /// queue into @p out (caller holds `mutex_`). Shared erase-while-
+  /// iterating loop of the teardown paths (close / abandon /
+  /// connection_lost); the registry policy stays with the caller.
+  template <class Pred>
+  void take_cells_locked(queue_type& out, Pred&& pred) {
+    for (auto it = write_queue_.begin(); it != write_queue_.end();) {
+      if (pred(*it)) {
+        out.push_back(std::move(*it));
+        it = write_queue_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
   /// True while @p op is still owned by the write queue (caller holds
   /// `mutex_`). Used by the write pump to re-validate staged pointers
   /// against tagged replies that raced ahead of the write completion.
@@ -534,12 +539,11 @@ class context_core
   void post_complete_stopped(cell_type cell) noexcept {
     try {
       auto core = this->shared_from_this();
-      auto* box = make_io_box(
-          alloc_, bexec::schedule(scheduler()),
+      start_io_box(
+          alloc_, [&] { return bexec::schedule(scheduler()); },
           [&cell, core = std::move(core)](io_box_base* self) mutable {
             return stopped_receiver(self, std::move(cell), std::move(core));
           });
-      box->start();
     } catch (...) {
       // No scheduler slot (allocation failure): complete inline.
       cell->complete_stopped();
@@ -568,14 +572,8 @@ class context_core
       if (phase_ == phase::open) {
         phase_ = phase::draining;
       }
-      for (auto it = write_queue_.begin(); it != write_queue_.end();) {
-        if ((*it)->is_staged()) {
-          ++it;  // Owned by the in-flight write until it completes.
-          continue;
-        }
-        taken.push_back(std::move(*it));
-        it = write_queue_.erase(it);
-      }
+      take_cells_locked(
+          taken, [](const cell_type& cell) { return !cell->is_staged(); });
       registry_.clear();
       continuation_target_ = nullptr;
       if (read_running_) {
@@ -677,6 +675,15 @@ class context_core
   bool kick_posted_ = false;
 
   // The single operation paused on a continuation request, if any.
+  // Invariant: the route exists from STAGING time — write_pump::kick()
+  // registers the operation as soon as a continuation-awaiting segment
+  // enters the staging buffer — so it is in place before any server
+  // response to those bytes can possibly be dispatched (io_uring orders
+  // no completions across operation types: the `+` CQE may be reaped
+  // before the write CQE that carried the request). The assignment in
+  // write_pump::on_write_done is an idempotent re-assertion;
+  // read_pump::dispatch_one(continuation) consumes and clears it, and
+  // every teardown path (close / abandon / connection_lost) drops it.
   operation_type* continuation_target_ = nullptr;
 
   // Read side: storage first, the buffer adapter aliases it.
@@ -698,6 +705,44 @@ class context_core
   phase phase_ = phase::open;
 
  private:
+  // ---- cancellation core ------------------------------------------------
+
+  /// Shared lookup+detach core of `cancel()` and `on_stop_requested()`
+  /// (caller holds `mutex_`): finds @p tag in the registry and detaches
+  /// the entry. With @p expected == nullptr any registered operation
+  /// matches (user-facing cancel); otherwise the entry must be @p
+  /// expected (stop-callback path). An empty registry hit means the
+  /// operation is not registered yet (registration race — the
+  /// registration path's take_stop_request() owns that case) or already
+  /// gone: returns null. Returns the extracted cell (also null when the
+  /// operation stays registered, e.g. an IDLE that queued DONE) and
+  /// sets @p kick when the write pump must be kicked.
+  cell_type find_and_detach_locked(std::string_view tag,
+                                   const operation_type* expected, bool& kick) {
+    auto it = registry_.find(tag);
+    if (it == registry_.end()) {
+      return nullptr;
+    }
+    if (expected != nullptr && it->second != expected) {
+      return nullptr;
+    }
+    return detach_locked(it, kick);
+  }
+
+  /// Completes a cancellation outside the mutex: kicks the write pump
+  /// for a queued DONE and posts the stop-completion of an extracted
+  /// cell through the scheduler (receivers are only ever completed from
+  /// the context's dispatch path, architecture §6 deadlock-avoidance
+  /// rule).
+  void finish_cancellation(cell_type cell, bool kick) noexcept {
+    if (kick) {
+      kick_write_pump();
+    }
+    if (cell != nullptr) {
+      post_complete_stopped(std::move(cell));
+    }
+  }
+
   // ---- sink implementation ---------------------------------------------
 
   void on_stop_requested(operation_type* op) noexcept override {
@@ -708,20 +753,9 @@ class context_core
       if (phase_ != phase::open) {
         return;
       }
-      auto it = registry_.find(op->tag());
-      if (it == registry_.end() || it->second != op) {
-        // Not registered yet (registration race) or already gone: the
-        // registration path's take_stop_request() owns the former case.
-        return;
-      }
-      cell = detach_locked(it, kick);
+      cell = find_and_detach_locked(op->tag(), op, kick);
     }
-    if (kick) {
-      kick_write_pump();
-    }
-    if (cell != nullptr) {
-      post_complete_stopped(std::move(cell));
-    }
+    finish_cancellation(std::move(cell), kick);
   }
 
   void kick_write_pump() noexcept override {
@@ -864,13 +898,15 @@ class imap_context {
 
   /**
    * Three-granularity cancellation (code_layout D3):
-   *  - queued, not yet written: removed from queue and registry; the
-   *    completion carries stop semantics — no bytes ever hit the wire;
+   *  - never staged any bytes to the wire: removed from queue and
+   *    registry; the completion carries stop semantics — the server
+   *    never saw the command;
    *  - written, awaiting its tagged reply: completed with stop semantics
    *    and detached; the reply is dropped on arrival, the connection
    *    stays usable;
    *  - a pending `idle_command` sends DONE first (its tagged reply still
-   *    completes the operation, with stop semantics).
+   *    completes the operation, with stop semantics) — including a
+   *    second cancel while the DONE segment itself is queued.
    * The completion runs on the context's dispatch path, never inline.
    */
   void cancel(std::string_view tag) { core_->cancel(tag); }

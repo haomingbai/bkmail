@@ -86,6 +86,20 @@ class io_runner {
   std::thread thread_;
 };
 
+/// RAII barrier: quiesces the runner on every exit path (the early error
+/// returns included), so deferred io-thread teardown always completes
+/// before the runner stops its io_context.
+class quiesce_guard {
+ public:
+  explicit quiesce_guard(io_runner& runner) noexcept : runner_(runner) {}
+  quiesce_guard(const quiesce_guard&) = delete;
+  quiesce_guard& operator=(const quiesce_guard&) = delete;
+  ~quiesce_guard() { runner_.quiesce(); }
+
+ private:
+  io_runner& runner_;
+};
+
 /// Prints "what: message" on stderr and returns true when ec is set.
 [[nodiscard]] bool failed(const char* what, std::error_code ec) {
   if (!ec) return false;
@@ -129,6 +143,11 @@ int main(int argc, char* argv[]) {
   const char* password = required_env("BKMAIL_PASSWORD");
 
   io_runner runner;
+  // Declared before every session object, so its destructor quiesces
+  // after they are all gone: deferred io-thread teardown (e.g. the
+  // connection detained after LOGOUT) must not be cut short by the
+  // runner's io_context stop, on any exit path.
+  quiesce_guard quiesce_on_exit{runner};
   bnio::ssl_context tls{bnio::ssl_context_method::tls_client};
 
   // Connect (implicit TLS) and consume the greeting. The connect sender
@@ -173,9 +192,7 @@ int main(int argc, char* argv[]) {
   if (total == 0) {
     auto logout = bth::sync_wait(std::move(selected).logout());
     if (!logout) return 1;
-    const int rc = failed("logout", std::get<0>(*logout)) ? 1 : 0;
-    runner.quiesce();
-    return rc;
+    return failed("logout", std::get<0>(*logout)) ? 1 : 0;
   }
 
   // FETCH the ENVELOPE of the five most recent messages.
@@ -203,7 +220,5 @@ int main(int argc, char* argv[]) {
   auto done = bth::sync_wait(std::move(selected_back).logout());
   if (!done) return 1;
   auto& [logout_ec, logged_out] = *done;
-  const int rc = failed("logout", logout_ec) ? 1 : 0;
-  runner.quiesce();
-  return rc;
+  return failed("logout", logout_ec) ? 1 : 0;
 }

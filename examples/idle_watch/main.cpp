@@ -104,6 +104,20 @@ class io_runner {
   std::thread thread_;
 };
 
+/// RAII barrier: quiesces the runner on every exit path (the early error
+/// returns included), so deferred io-thread teardown always completes
+/// before the runner stops its io_context.
+class quiesce_guard {
+ public:
+  explicit quiesce_guard(io_runner& runner) noexcept : runner_(runner) {}
+  quiesce_guard(const quiesce_guard&) = delete;
+  quiesce_guard& operator=(const quiesce_guard&) = delete;
+  ~quiesce_guard() { runner_.quiesce(); }
+
+ private:
+  io_runner& runner_;
+};
+
 [[nodiscard]] bool failed(const char* what, std::error_code ec) {
   if (!ec) return false;
   std::fprintf(stderr, "%s: %s\n", what, ec.message().c_str());
@@ -187,6 +201,11 @@ int main(int argc, char* argv[]) {
   std::signal(SIGINT, on_sigint);
 
   io_runner runner;
+  // Declared before every session object, so its destructor quiesces
+  // after they are all gone: deferred io-thread teardown (e.g. the
+  // connection detained after LOGOUT) must not be cut short by the
+  // runner's io_context stop, on any exit path.
+  quiesce_guard quiesce_on_exit{runner};
   bnio::ssl_context tls{bnio::ssl_context_method::tls_client};
 
   // Connect, log in, and select INBOX (plain sync_wait_with_variant steps;
@@ -256,6 +275,11 @@ int main(int argc, char* argv[]) {
       }
       // `op` must not outlive the completion it delivered.
     }
+    // Barrier: the io thread released outcome.done from inside the idle
+    // receiver and may still be in that call chain; quiesce before this
+    // iteration's stack objects (outcome, and the state it may hand
+    // back) go out of scope.
+    runner.quiesce();
 
     if (outcome.stopped) {
       // set_stopped: DONE was sent, but the state is not handed back, so
@@ -287,9 +311,9 @@ int main(int argc, char* argv[]) {
   }
 
   if (cancelled) {
-    // The idle cycle completed with set_stopped; let the io thread finish
-    // any deferred teardown before the runner goes away.
-    runner.quiesce();
+    // The idle cycle completed with set_stopped; the session ends here by
+    // destruction. quiesce_on_exit lets the io thread finish any deferred
+    // teardown before the runner goes away.
     return 0;
   }
 
@@ -297,7 +321,5 @@ int main(int argc, char* argv[]) {
   auto done = bth::sync_wait(std::move(selected).logout());
   if (!done) return 1;
   auto& [logout_ec, logged_out] = *done;
-  const int rc = failed("logout", logout_ec) ? 1 : 0;
-  runner.quiesce();
-  return rc;
+  return failed("logout", logout_ec) ? 1 : 0;
 }

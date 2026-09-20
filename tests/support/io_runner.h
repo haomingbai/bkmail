@@ -32,6 +32,7 @@
 #include <mutex>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 namespace bkmail::test {
@@ -65,9 +66,44 @@ class io_runner {
    */
   void quiesce();
 
+  /**
+   * Runs @p f once ON the io worker thread and waits for it on the calling
+   * thread (same skeleton as quiesce(): schedule() through the post
+   * scheduler, a receiver that invokes @p f and then arrives; bounded
+   * wait). Because the task is queued behind everything posted before it,
+   * work @p f triggers (e.g. a cancel pass posting a pump kick) lands
+   * strictly BEHIND the running task — the queue-order pin that keeps a
+   * scripted interleaving deterministic.
+   * Defined after the detail receiver below.
+   */
+  template <class F>
+  void run_on_worker(F&& f);
+
  private:
   bnio::io_context ioc_;
   std::thread thread_;
+};
+
+/**
+ * RAII teardown barrier for the same happens-before guarantee as
+ * quiesce(), applied to every exit path of a test body: declared
+ * immediately after the objects a receiver references (the started
+ * operation state, or the locals handlers capture), its destructor
+ * quiesces the runner BEFORE those objects are destroyed — so an early
+ * ASSERT failure unwinding the test cannot destroy them while an io
+ * worker is still inside a receiver.
+ */
+class quiesce_guard {
+ public:
+  explicit quiesce_guard(io_runner& runner) noexcept : runner_(runner) {}
+
+  quiesce_guard(const quiesce_guard&) = delete;
+  quiesce_guard& operator=(const quiesce_guard&) = delete;
+
+  ~quiesce_guard() { runner_.quiesce(); }
+
+ private:
+  io_runner& runner_;
 };
 
 /**
@@ -143,6 +179,29 @@ class quiesce_receiver {
   signal_event* done_;
 };
 
+/// Receiver completing io_runner::run_on_worker()'s task: invokes the
+/// stored callable on the io worker, then arrives. The callable is held by
+/// value so the caller's locals need not outlive the queue wait.
+template <class F>
+class run_on_worker_receiver {
+ public:
+  run_on_worker_receiver(F f, signal_event* done) noexcept
+      : f_(std::move(f)), done_(done) {}
+
+  void set_value(std::error_code ec) noexcept {
+    if (!ec) {
+      f_();
+    }
+    done_->arrive();
+  }
+
+  void set_stopped() noexcept { done_->arrive(); }
+
+ private:
+  F f_;
+  signal_event* done_;
+};
+
 }  // namespace detail
 
 inline void io_runner::quiesce() {
@@ -151,6 +210,17 @@ inline void io_runner::quiesce() {
                                   detail::quiesce_receiver{&done});
   bexec::start(operation);
   done.wait();
+}
+
+template <class F>
+void io_runner::run_on_worker(F&& f) {
+  signal_event done;
+  auto operation =
+      bexec::connect(ioc_.get_post_scheduler().schedule(),
+                     detail::run_on_worker_receiver<std::decay_t<F>>{
+                         std::forward<F>(f), &done});
+  bexec::start(operation);
+  (void)done.wait_for(kDefaultTimeout);
 }
 
 }  // namespace bkmail::test

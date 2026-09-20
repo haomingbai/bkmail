@@ -103,9 +103,11 @@ inline void base64_encode(std::string_view in, std::string& out) {
  * TLS.
  *
  * The handshake phase has no Layer-1 tag and cannot be cancelled; a stop
- * request arriving during it is latched and honoured as soon as the
- * handshake completes (handshakes are short). Command phases cancel through
- * imap_context::cancel as usual.
+ * request arriving during it (or racing the tagged reply into the latch)
+ * is recorded in stop_latch_ and honoured at the next completion point
+ * (handshakes are short). Command phases cancel through imap_context::cancel
+ * as usual; the stopped completion itself is delivered from the context's
+ * dispatch path (§6 contract), never inline on the requesting thread.
  */
 template <class Allocator, class Receiver>
 class start_tls_operation {
@@ -155,19 +157,32 @@ class start_tls_operation {
     start_tls_operation* op;
 
     void operator()() const noexcept {
+      // Record the request FIRST: one that loses the completion claim
+      // below is honoured at the next io-thread completion point
+      // (on_starttls / on_handshake / on_capability) — never lost.
+      op->stop_latch_.store(true, std::memory_order_release);
       if (op->phase_.load(std::memory_order_acquire) == phase::handshake) {
-        // No cancellable Layer-1 command is in flight; latch the request
-        // and let on_handshake deliver the stopped completion.
-        op->stop_during_handshake_.store(true, std::memory_order_release);
+        // No cancellable Layer-1 command is in flight; on_handshake
+        // delivers the stopped completion.
         return;
       }
-      if (op->completed_.exchange(true, std::memory_order_acq_rel)) {
-        return;
-      }
+      // Cancellable command phase (STARTTLS or CAPABILITY): drop the
+      // reply on arrival, then complete.
       op->connection_.with_context(
           [tag = op->tag_](auto& ctx) mutable { ctx.cancel(tag); });
+      if (op->completed_->exchange(true, std::memory_order_acq_rel)) {
+        // on_starttls holds the claim (audit F5) or a rival completion
+        // won; the latch above routes the request to the next
+        // completion point.
+        return;
+      }
       op->connection_.finish_operation();
-      bexec::set_stopped(std::move(op->receiver_));
+      op->stop_callback_.reset();
+      // §6 contract: the receiver is completed from the context's
+      // dispatch path, never inline on the requesting thread.
+      post_stopped_delivery(op->connection_.get_allocator(),
+                            op->connection_.io_context(), op->receiver_,
+                            op->completed_);
     }
   };
 
@@ -188,16 +203,22 @@ class start_tls_operation {
   using handshake_op = decltype(bexec::connect(
       std::declval<handshake_sender>(), std::declval<handshake_receiver>()));
 
-  using env_type = decltype(bexec::get_env(std::declval<const Receiver&>()));
-  using stop_token_type =
-      decltype(bexec::get_stop_token(std::declval<const env_type&>()));
-  using stop_callback =
-      typename stop_token_type::template callback_type<stop_forwarder>;
-
   /// STARTTLS tagged reply: on OK, detach the socket and start the
   /// client handshake; anything else keeps the plaintext state.
   void on_starttls(std::error_code ec) noexcept {
-    if (completed_.load(std::memory_order_acquire)) {
+    // Audit F5: claim via exchange, not a plain load — winning closes the
+    // race window against the stop forwarder for the whole reply
+    // handling; losing means the forwarder (or a rival) owns the
+    // operation and the reply is dropped.
+    if (completed_->exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    if (stop_latch_.load(std::memory_order_acquire)) {
+      // A stop request landed before this reply (the forwarder already
+      // cancelled the command): deliver it. Runs on the io dispatch path.
+      stop_callback_.reset();
+      connection_.finish_operation();
+      bexec::set_stopped(std::move(receiver_));
       return;
     }
     if (ec) {
@@ -219,17 +240,17 @@ class start_tls_operation {
   /// CAPABILITY; on failure the session is dead (TLS errors arrive in the
   /// OpenSSL error category) and the retained state carries the dead
   /// connection, so the failure surfaces again on the next operation.
+  ///
+  /// The completed_ claim has been held since on_starttls won its
+  /// exchange (audit F5) — handshake_op_ is only armed there, so no rival
+  /// completion can exist here and no re-claim is needed.
   void on_handshake(std::error_code ec) noexcept {
-    if (stop_during_handshake_.load(std::memory_order_acquire)) {
-      if (completed_.exchange(true, std::memory_order_acq_rel)) {
-        return;
-      }
+    if (stop_latch_.load(std::memory_order_acquire)) {
+      // A stop request landed during the (uncancellable) handshake: the
+      // operation completes stopped. Runs on the io dispatch path.
       stop_callback_.reset();
       connection_.finish_operation();
       bexec::set_stopped(std::move(receiver_));
-      return;
-    }
-    if (completed_.load(std::memory_order_acquire)) {
       return;
     }
     // Keep the connection object whole even on failure: the dead TLS
@@ -252,19 +273,27 @@ class start_tls_operation {
   }
 
   /// CAPABILITY reply over the upgraded context: refresh the cache and
-  /// hand the Not-Authenticated state (over TLS) back.
+  /// hand the Not-Authenticated state (over TLS) back. A stop request
+  /// that latched during the probe (the forwarder cancelled the command
+  /// in passing) is honoured here.
   void on_capability(std::error_code ec,
                      capability_set<Allocator> caps) noexcept {
+    if (stop_latch_.load(std::memory_order_acquire)) {
+      stop_callback_.reset();
+      connection_.finish_operation();
+      bexec::set_stopped(std::move(receiver_));
+      return;
+    }
     if (!ec) {
       connection_.set_capabilities(std::move(caps));
     }
     complete(ec);
   }
 
+  /// Value delivery; callers hold the completed_ claim (audit F5), so a
+  /// once-only delivery needs no re-claim here. Runs on the io dispatch
+  /// path.
   void complete(std::error_code ec) noexcept {
-    if (completed_.exchange(true, std::memory_order_acq_rel)) {
-      return;
-    }
     stop_callback_.reset();
     connection_.finish_operation();
     bexec::set_value(
@@ -279,10 +308,14 @@ class start_tls_operation {
   std::optional<tls_stream> tls_stream_;
   std::optional<bexec::detail::pass_through_operation<handshake_op>>
       handshake_op_;
-  std::optional<stop_callback> stop_callback_;
+  stop_callback_box<Receiver, stop_forwarder> stop_callback_;
   std::atomic<phase> phase_ = phase::starttls;
-  std::atomic<bool> stop_during_handshake_ = false;
-  std::atomic<bool> completed_ = false;
+  // Stop requests recorded here are honoured at the next completion
+  // point when the claiming stop path lost its race (see stop_forwarder).
+  std::atomic<bool> stop_latch_ = false;
+  // Shared so the posted stopped-delivery task can hold a flag copy.
+  std::shared_ptr<std::atomic<bool>> completed_ =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 /// Sender behind not_authenticated_state::start_tls().
@@ -348,35 +381,25 @@ class not_authenticated_state {
    * current state — on NO/BAD or a transport failure.
    */
   [[nodiscard]] auto login(const account_info<Allocator>& account) && {
-    return detail::state_op_sender{
-        std::move(connection_), login_command<Allocator>{account},
-        detail::branch_on_error(
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return authenticated_state<Allocator>{std::move(conn)};
-            },
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return not_authenticated_state{std::move(conn)};
-            })};
+    return detail::state_op_sender{std::move(connection_),
+                                   login_command<Allocator>{account},
+                                   detail::auth_branches<Allocator>()};
   }
 
   /**
-   * AUTHENTICATE with a SASL mechanism (SASL-IR aware when
-   * @p initial_response is non-empty). Same completion contract as
-   * login(): Authenticated on OK, the retained Not-Authenticated state
-   * otherwise.
+   * AUTHENTICATE with a SASL mechanism. The command type models SASL-IR,
+   * but the state layer currently always uses the two-step challenge
+   * exchange (usage.md §8) — @p initial_response is carried as the SASL
+   * payload, not as an initial response on the command line. Same
+   * completion contract as login(): Authenticated on OK, the retained
+   * Not-Authenticated state otherwise.
    */
   [[nodiscard]] auto authenticate(std::string_view mechanism,
                                   std::string_view initial_response) && {
     return detail::state_op_sender{
         std::move(connection_),
         authenticate_command<Allocator>{mechanism, initial_response},
-        detail::branch_on_error(
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return authenticated_state<Allocator>{std::move(conn)};
-            },
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return not_authenticated_state{std::move(conn)};
-            })};
+        detail::auth_branches<Allocator>()};
   }
 
   /**
@@ -401,13 +424,7 @@ class not_authenticated_state {
     return detail::state_op_sender{
         std::move(connection_),
         authenticate_command<Allocator>{"XOAUTH2", encoded},
-        detail::branch_on_error(
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return authenticated_state<Allocator>{std::move(conn)};
-            },
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-              return not_authenticated_state{std::move(conn)};
-            })};
+        detail::auth_branches<Allocator>()};
   }
 
   /**
@@ -426,38 +443,33 @@ class not_authenticated_state {
   [[nodiscard]] auto capability() && {
     return detail::state_op_sender{
         std::move(connection_), capability_command<Allocator>{},
-        [](std::error_code ec, imap_connection<Allocator> conn,
-           capability_set<Allocator> caps) {
-          if (!ec) {
-            conn.set_capabilities(caps);
-          }
-          return std::pair{std::move(caps),
-                           not_authenticated_state{std::move(conn)}};
-        }};
+        detail::capability_successor<Allocator>(
+            detail::same_state_successor<not_authenticated_state,
+                                         Allocator>())};
   }
 
   /// NOOP (protocol keep-alive).
   [[nodiscard]] auto noop() && {
-    return detail::state_op_sender{
-        std::move(connection_), noop_command<Allocator>{},
-        [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-          return not_authenticated_state{std::move(conn)};
-        }};
+    return same_state_op(noop_command<Allocator>{});
   }
 
   /// LOGOUT: the connection is torn down; yields the terminal state.
   [[nodiscard]] auto logout() && {
-    return detail::state_op_sender{
-        std::move(connection_), logout_command<Allocator>{},
-        [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-          // The completion runs inside the read dispatch; the connection's
-          // destruction is detained to after the dispatch unwinds.
-          detail::detain_connection(std::move(conn));
-          return logout_state<Allocator>{};
-        }};
+    return detail::state_op_sender{std::move(connection_),
+                                   logout_command<Allocator>{},
+                                   detail::logout_successor<Allocator>()};
   }
 
  private:
+  /// Helper for void-result operations whose successor is this same state.
+  /// Only called from &&-qualified operations, which own the connection.
+  template <class Command>
+  [[nodiscard]] auto same_state_op(Command command) {
+    return detail::state_op_sender{
+        std::move(connection_), std::move(command),
+        detail::same_state_successor<not_authenticated_state, Allocator>()};
+  }
+
   imap_connection<Allocator> connection_;
 };
 

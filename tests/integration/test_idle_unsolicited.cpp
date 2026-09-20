@@ -46,6 +46,7 @@ using bkmail::test::expect_client;
 using bkmail::test::fake_imap_server;
 using bkmail::test::io_runner;
 using bkmail::test::kDefaultTimeout;
+using bkmail::test::quiesce_guard;
 using bkmail::test::server_send;
 using bkmail::test::server_step;
 using bkmail::test::signal_event;
@@ -203,6 +204,10 @@ TEST(IdleUnsolicited, IdleCancelSendsDoneAndCompletesStopped) {
       bexec::connect(std::move(selected).idle(),
                      idle_receiver{stop_src.get_token(), stopped, value_calls});
   bexec::start(op);
+  // Covers every early return below: the io worker must have left the
+  // receiver call chain before the stack-allocated operation state and
+  // receiver go out of scope.
+  quiesce_guard teardown{runner};
 
   // Cancel only once the IDLE command is actually on the wire.
   ASSERT_TRUE(server.wait_received("IDLE", kDefaultTimeout));
@@ -216,9 +221,6 @@ TEST(IdleUnsolicited, IdleCancelSendsDoneAndCompletesStopped) {
 
   EXPECT_TRUE(server.wait_done(kDefaultTimeout));
   EXPECT_TRUE(server.ok()) << server.errors();
-  // Barrier: the io worker must have left the receiver call chain before
-  // the stack-allocated operation state and receiver go out of scope.
-  runner.quiesce();
 }
 
 // usage.md §2.1: unsolicited EXPUNGE/FETCH(FLAGS) pushed between commands

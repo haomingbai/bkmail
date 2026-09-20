@@ -16,13 +16,11 @@
 #include <support/scripted_stream.h>
 
 #include <bexec/bexec.hpp>
-#include <chrono>
 #include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <utility>
 
 #include "layer1_fixture.h"
@@ -34,6 +32,7 @@ using bkmail::test::expect_write;
 using bkmail::test::kDefaultTimeout;
 using bkmail::test::kLayer1Greeting;
 using bkmail::test::poll_until;
+using bkmail::test::quiesce_guard;
 using bkmail::test::server_bytes;
 using bkmail::test::signal_event;
 
@@ -55,9 +54,14 @@ TEST(WritePump, SubmitQueuesBytesWithoutIoUntilFlush) {
                [&](std::error_code) { first_done.arrive(); });
   h.ctx.submit(im::noop_command<>{},
                [&](std::error_code) { second_done.arrive(); });
+  // Covers every early return below: the io worker must have left all
+  // receiver call chains before the locals the handlers reference die.
+  quiesce_guard teardown{h.runner};
 
-  // Give any rogue I/O a chance: nothing may be written before flush().
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  // Deterministic negative assertion: after the quiesce barrier every
+  // task posted so far has run, yet nothing may have been written
+  // before flush().
+  h.runner.quiesce();
   EXPECT_TRUE(h.recorder.writes().empty());
   EXPECT_TRUE(h.recorder.written().empty());
 
@@ -82,19 +86,24 @@ TEST(WritePump, FlushOnEmptyQueueWritesNothing) {
   });
 
   h.ctx.flush();
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  // Barrier: every task posted so far has run; flushing an empty queue
+  // must not have written.
+  h.runner.quiesce();
   EXPECT_TRUE(h.recorder.writes().empty())
       << "flushing an empty queue must not write";
 
   signal_event done;
   h.ctx.submit(im::noop_command<>{}, [&](std::error_code) { done.arrive(); });
+  // Covers every early return below: the io worker must have left the
+  // handler call chain before the locals it references die.
+  quiesce_guard teardown{h.runner};
   h.ctx.flush();
   ASSERT_TRUE(done.wait_for(kDefaultTimeout));
   EXPECT_EQ(1U, h.recorder.writes().size());
 
   // A second flush with nothing new pending stays silent.
   h.ctx.flush();
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  h.runner.quiesce();
   EXPECT_EQ(1U, h.recorder.writes().size());
 }
 
@@ -113,6 +122,9 @@ TEST(WritePump, ConsecutiveFlushesProduceConsecutiveWrites) {
   signal_event second_done;
   h.ctx.submit(im::noop_command<>{},
                [&](std::error_code) { first_done.arrive(); });
+  // Covers every early return below: the io worker must have left the
+  // handler call chain before the locals it references die.
+  quiesce_guard teardown{h.runner};
   h.ctx.flush();
   ASSERT_TRUE(first_done.wait_for(kDefaultTimeout));
 
@@ -163,6 +175,9 @@ TEST(WritePump, InterleavedBatchesKeepElementsStable) {
   // First batch: one command on the wire.
   const auto first_tag = submit_noop();
   EXPECT_EQ("a0001", first_tag);
+  // Covers every early return below: the io worker must have left all
+  // handler call chains before the locals they reference die.
+  quiesce_guard teardown{h.runner};
   h.ctx.flush();
   ASSERT_TRUE(h.recorder.wait_written("a0001 NOOP", kDefaultTimeout));
 
@@ -240,15 +255,16 @@ TEST(WritePump, SenderPathKicksWriteOnEmptyQueue) {
   auto operation =
       bexec::connect(std::move(sender), sender_path_receiver{done, ec});
   bexec::start(operation);
+  // Covers every early return below: the io worker must have left the
+  // receiver call chain before the stack-allocated operation state and
+  // receiver go out of scope.
+  quiesce_guard teardown{h.runner};
 
   ASSERT_TRUE(done.wait_for(kDefaultTimeout))
       << "the started sender must complete without any flush()";
   EXPECT_FALSE(ec) << ec.message();
   EXPECT_TRUE(h.recorder.contains_written("a0001 NOOP"));
   EXPECT_EQ(1U, h.recorder.writes().size());
-  // Barrier: the io worker must have left the receiver call chain before
-  // the stack-allocated operation state and receiver go out of scope.
-  h.runner.quiesce();
 }
 
 }  // namespace

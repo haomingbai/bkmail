@@ -9,7 +9,7 @@ bkmail is an IMAP (RFC 3501) client library built on two layers:
 
 | Layer | Header-facing types | Use it when |
 | --- | --- | --- |
-| State-machine layer | session states in `bkmail::imap`: `not_authenticated_state`, `authenticated_state`, `selected_state`, `logout_state` (+ the `idle_state` handle) | You want a sequential, type-safe conversation with one IMAP server. This is the default choice. |
+| State-machine layer | session states in `bkmail::imap`: `not_authenticated_state`, `authenticated_state`, `selected_state`, `logout_state` | You want a sequential, type-safe conversation with one IMAP server. This is the default choice. |
 | Command layer | `bkmail::imap::imap_context` plus one type per IMAP command | You need parallel commands, batched writes, custom/extension commands, or manual control over I/O scheduling. |
 
 The protocol types of both layers live in `namespace bkmail::imap`; the
@@ -247,6 +247,17 @@ Note the shape that repeats at every step:
 3. `sync_wait`/`sync_wait_with_variant` return `std::optional<...>`;
    `std::nullopt` means the operation was stopped via a stop token (§2.7).
 
+One more rule for every blocking flow above: give the io thread one final
+turn before your locals die. The bundled examples
+(`examples/list_subjects/`, `examples/idle_watch/`) extend `io_runner`
+with a `quiesce()` method that runs one empty task through the context
+and waits for it. Call `runner.quiesce()` on every exit path — success,
+early error, and the end of the program — so that completions already
+posted to the scheduler run while the stack-allocated operation states
+and receivers are still alive, and so that the deferred teardown after
+LOGOUT (the connection is detained one event-loop turn) finishes before
+the runner is destroyed and `ioc.stop()` ends the loop.
+
 ### 1.4 The same flow as a coroutine
 
 `bexec::task` can `co_await` any sender, with one restriction: the awaited
@@ -443,9 +454,10 @@ end of the chain. Single-signature operations chain directly.
 Every value tuple starts with `std::error_code`. A default-constructed
 (falsy) code means success; the remaining tuple elements are the result (for
 querying operations) and the next state. The next state is delivered by the
-sender even when the operation failed, unless the failure killed the
-connection — see §6 for which errors are recoverable and which mean
-"rebuild the session".
+sender for every non-stopped completion, including failures — see §6 for
+which errors are recoverable and which mean "rebuild the session" (when a
+failure killed the connection, the delivered state is simply unusable;
+follow §6's reconnect policy and discard it).
 
 ```cpp
 auto result = bexec::this_thread::sync_wait(
@@ -661,8 +673,13 @@ Operation senders take their stop token from the receiver's environment
 `never_stop_token`, so blocking waits cannot be cancelled; use a receiver
 whose env carries an `inplace_stop_token`. Requesting stop makes the
 operation complete with `set_stopped()` (it never reports cancellation
-through the error code). For `idle()` specifically, bkmail sends `DONE`
-before completing, so the server stays in sync.
+through the error code). Like every completion, the stopped delivery runs
+on the thread running the borrowed `io_context` — never inline on the
+thread that requested the stop — so the `io_context` must still be live
+for it to arrive. For `idle()` specifically, bkmail queues `DONE` before
+completing, so the server stays in sync; DONE reaches the wire
+asynchronously and needs that same live `io_context`. Cancel a tag at
+most once.
 
 ```cpp
 class idle_printer {
@@ -680,7 +697,7 @@ class idle_printer {
     // Keep `state` alive somewhere if the session should continue.
   }
 
-  void set_stopped() noexcept { std::puts("idle cancelled (DONE sent)"); }
+  void set_stopped() noexcept { std::puts("idle cancelled (DONE queued)"); }
 
  private:
   env_type env_;
@@ -695,9 +712,10 @@ bexec::start(op);
 stop_src.request_stop();
 ```
 
-The same receiver pattern cancels any other operation; bkmail then stops
-waiting for the tagged response and discards it when it arrives (IMAP cannot
-un-send a command).
+The same receiver pattern cancels any other operation. A command still
+queued — nothing on the wire yet — is withdrawn outright; once any of its
+bytes were staged to the wire, IMAP cannot un-send them, so bkmail stops
+waiting for the tagged response and discards it when it arrives.
 
 ---
 
@@ -829,11 +847,26 @@ A handler is invoked exactly once, on the thread running the borrowed
 `io_context`, when the tagged completion (`OK` / `NO` / `BAD`) for its
 command arrives. A `NO` is reported as `errc::command_rejected`, a `BAD` as
 `errc::bad_command` — both arrive through the error code, never as
-exceptions.
+exceptions. One exception to the thread rule: a queued, never-written
+command failed by `close()` runs its handler on the calling thread, with
+`std::errc::operation_canceled` (see the lifecycle note below).
 
-`ctx.cancel(tag)` withdraws a handler: the response is discarded when it
-arrives, and — special case — cancelling a pending `idle_command` sends
-`DONE` first. Cancellation never waits for the server.
+`ctx.cancel(tag)` withdraws a handler — cancel a tag at most once. A
+command that was never staged to the wire is removed outright: no bytes
+ever hit it. Once any byte of the command was staged, it can no longer be
+extracted; cancelling a pending `idle_command` then queues `DONE`
+(asynchronous — it reaches the server only while a thread runs the
+`io_context`), and every other command is detached, its response discarded
+when it arrives. Cancellation never waits for the server.
+
+**Session lifecycle: `close()` versus destruction.** `ctx.close()` ends
+the session but lets queued work fail visibly: commands still queued and
+never written are failed immediately on the calling thread with
+`std::errc::operation_canceled` (their handlers run there), and commands
+already on the wire fail when the read side dies. Destroying the context —
+or the last state holding the `imap_connection` on the state-machine layer
+— is the quieter exit: pending handlers are dropped and never invoked.
+The same distinction holds for both `imap_context` and `imap_connection`.
 
 Available command types and their handler result types:
 
@@ -944,6 +977,11 @@ surfaces through this handler too: an `OK`/`PREAUTH` greeting arrives as
 `BYE` greeting — as `bye_event`. Later untagged `OK`s (resp-code carriers)
 also arrive as `greeting_event` and are ignorable by login flows.
 
+Register the handler immediately after constructing the context: the read
+pump arms in the constructor, so a fast server can deliver the greeting
+before any `on_unsolicited` registration exists — an event delivered in
+that window is not observed.
+
 ### 3.6 When I/O actually happens
 
 The context runs **one permanent `async_read`** from construction until
@@ -993,7 +1031,7 @@ empty string.
 | `adl` | string | addr-adl (at-domain list / source route; obsolete, usually NIL) |
 | `mailbox_name` | string | addr-mailbox (local part) |
 | `host_name` | string | addr-host |
-| `email()` | string | `"mailbox_name@host_name"` convenience accessor |
+| `email()` | string | `"mailbox_name@host_name"` convenience accessor; bare `mailbox_name` when `host_name` is empty |
 
 ### `envelope<A>`
 
@@ -1037,6 +1075,8 @@ fetch through the command layer).
 | --- | --- | --- |
 | `media_type` / `subtype` | string | e.g. `"text"` / `"html"` |
 | `parameters` | `std::vector<std::pair<string, string>>` | attribute/value pairs |
+| `id` | string | Content-ID of the part (usually empty) |
+| `description` | string | Content-Description of the part (usually empty) |
 | `encoding` | string | e.g. `"quoted-printable"`, `"base64"` |
 | `octets` | `std::uint64_t` | body size in octets |
 | `parts` | `std::vector<body_structure<A>>` | children for multipart types |

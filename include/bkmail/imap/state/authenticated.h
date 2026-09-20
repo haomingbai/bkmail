@@ -80,35 +80,17 @@ class authenticated_state {
    * SELECT selects no mailbox, so the session stays Authenticated.
    */
   [[nodiscard]] auto select(std::string_view mailbox) && {
-    return detail::state_op_sender{
-        std::move(connection_), select_command<Allocator>{mailbox},
-        detail::branch_on_error(
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn,
-               mailbox_info<Allocator> info) {
-              return selected_state<Allocator>{std::move(conn),
-                                               std::move(info)};
-            },
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn,
-               mailbox_info<Allocator> /*info*/) {
-              return authenticated_state{std::move(conn)};
-            })};
+    return detail::state_op_sender{std::move(connection_),
+                                   select_command<Allocator>{mailbox},
+                                   detail::select_branches<Allocator>()};
   }
 
   /// EXAMINE (read-only twin of select); same completion contract, with
   /// read_only set in the Selected state's snapshot.
   [[nodiscard]] auto examine(std::string_view mailbox) && {
-    return detail::state_op_sender{
-        std::move(connection_), examine_command<Allocator>{mailbox},
-        detail::branch_on_error(
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn,
-               mailbox_info<Allocator> info) {
-              return selected_state<Allocator>{std::move(conn),
-                                               std::move(info)};
-            },
-            [](std::error_code /*ec*/, imap_connection<Allocator> conn,
-               mailbox_info<Allocator> /*info*/) {
-              return authenticated_state{std::move(conn)};
-            })};
+    return detail::state_op_sender{std::move(connection_),
+                                   examine_command<Allocator>{mailbox},
+                                   detail::select_branches<Allocator>()};
   }
 
   /// LIST mailboxes under @p reference matching @p pattern ("" + "*"
@@ -173,14 +155,8 @@ class authenticated_state {
   [[nodiscard]] auto capability() && {
     return detail::state_op_sender{
         std::move(connection_), capability_command<Allocator>{},
-        [](std::error_code ec, imap_connection<Allocator> conn,
-           capability_set<Allocator> caps) {
-          if (!ec) {
-            conn.set_capabilities(caps);
-          }
-          return std::pair{std::move(caps),
-                           authenticated_state{std::move(conn)}};
-        }};
+        detail::capability_successor<Allocator>(
+            detail::same_state_successor<authenticated_state, Allocator>())};
   }
 
   /// NOOP (protocol keep-alive).
@@ -190,14 +166,9 @@ class authenticated_state {
 
   /// LOGOUT: the connection is torn down; yields the terminal state.
   [[nodiscard]] auto logout() && {
-    return detail::state_op_sender{
-        std::move(connection_), logout_command<Allocator>{},
-        [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-          // The completion runs inside the read dispatch; the connection's
-          // destruction is detained to after the dispatch unwinds.
-          detail::detain_connection(std::move(conn));
-          return logout_state<Allocator>{};
-        }};
+    return detail::state_op_sender{std::move(connection_),
+                                   logout_command<Allocator>{},
+                                   detail::logout_successor<Allocator>()};
   }
 
  private:
@@ -207,9 +178,7 @@ class authenticated_state {
   [[nodiscard]] auto same_state_op(Command command) {
     return detail::state_op_sender{
         std::move(connection_), std::move(command),
-        [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
-          return authenticated_state{std::move(conn)};
-        }};
+        detail::same_state_successor<authenticated_state, Allocator>()};
   }
 
   imap_connection<Allocator> connection_;

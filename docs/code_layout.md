@@ -80,7 +80,7 @@ shutdown-drain model is the implementation truth (it is what stop tokens
 can physically do in bnio). The public Layer-1 surface is the usage
 document's single `imap_context::cancel(tag)`: it maps onto queue removal
 for not-yet-written commands and onto detach-drop-on-arrival for written
-ones, and sends `DONE` first when cancelling a pending `idle_command`.
+ones, and queues `DONE` first when cancelling a pending `idle_command`.
 Sender-path operations additionally honour receiver stop tokens end to end
 (`set_stopped()`). Layer 2 has no extra machinery. The timeout adaptor
 (`detail::with_timeout`) stays internal.
@@ -90,9 +90,9 @@ follow architecture.md.** Layer-1 types are `*_command` (`login_command`,
 `capability_command`, …) with `uid_`-prefixed UID variants and an
 extension escape hatch `raw_command`; Layer-1 result types are plain values
 per command (§5.2), with `NO`/`BAD` mapped to `errc` codes on the callback
-path. State types are the architecture's five
+path. State types are the architecture's four
 (`not_authenticated_state`, `authenticated_state`, `selected_state`,
-`logout_state`, `idle_state`). State method names follow usage.md §2.1
+`logout_state`). State method names follow usage.md §2.1
 (`fetch_envelopes`, `fetch_headers`, `fetch_message`, `move`, …) because
 they carry the operation's fetch-item intent that architecture's generic
 `fetch(items)` leaves to a parameter type; the full table is §5.3.
@@ -148,7 +148,7 @@ compromise was replaced wholesale once the layer settled:
 
 - The `session_state<A>` and `greeting_state<A>` variant aliases are
   **deleted** from the public API; `imap/session_state.h` carries only the
-  five forward declarations. Merging alternatives into a variant is a
+  four forward declarations. Merging alternatives into a variant is a
   **consumer-side choice** (`bexec::this_thread::sync_wait_with_variant`
   for blocking waits, `bexec::into_variant` ahead of `co_await`), never a
   library-spelled payload.
@@ -293,7 +293,7 @@ migration note at the top); namespaces unchanged.
 | `imap/imap_command.h` | [H] | `imap::imap_command<Allocator>` erased handle (unique_ptr wrapper over `operation_base`), `imap::make_command(command, handler)`. brief: *Type-erased IMAP command for batch submission.* |
 | `imap/imap_context.h` | [H] | `imap::imap_context<Stream, Allocator>` shell + `detail::context_core<Stream, Allocator>` (the heap-held state shared with the in-flight pump boxes; architecture §3.2a — one coupled group in one file). brief: *IMAP command/connection context owning the stream.* |
 | `imap/imap_connection.h` | [H] | `imap::imap_connection<Allocator>` (variant owner, capability cache, `close()`, STARTTLS relocation hooks, the one-operation-in-flight slot) + `detail::detain_connection` (LOGOUT teardown deferred past the read dispatch). brief: *Owns an IMAP connection across plaintext and TLS.* |
-| `imap/session_state.h` | [H] | forward declarations of the five states only (D9: the `session_state`/`greeting_state` variant aliases are gone). brief: *Forward declarations of the five Layer-2 session states.* |
+| `imap/session_state.h` | [H] | forward declarations of the four states only (D9: the `session_state`/`greeting_state` variant aliases are gone). brief: *Forward declarations of the four Layer-2 session states.* |
 | `imap/command.h` | [AGG] | includes every `imap/command/*.h`, `imap/imap_command.h`. brief: *Aggregate header for all IMAP command types.* |
 
 ### 3.3 `include/bkmail/imap/state/` — Layer 2
@@ -304,7 +304,6 @@ migration note at the top); namespaces unchanged.
 | `state/authenticated.h` | [H] | `authenticated_state<Allocator>`. brief: *IMAP Authenticated session state.* |
 | `state/selected.h` | [H] | `selected_state<Allocator>` (holds `mailbox_info` snapshot). brief: *IMAP Selected session state.* |
 | `state/logout.h` | [H] | `logout_state<Allocator>` (terminal, dataless). brief: *IMAP Logout session state.* |
-| `state/idle.h` | [H] | `idle_state<Allocator>` (exclusive IDLE handle, `on_event`, `done()`, `stop()`). brief: *RFC 2177 IDLE session state.* |
 
 ### 3.4 `include/bkmail/imap/command/` — one command per file
 
@@ -469,13 +468,13 @@ Expected largest files and their controls, as implemented:
 | `imap/operation_base.h` | ~700 | The whole erasure group (operation_base/operation_sink/operation_model/op_deleter/io_box/concepts) is one internal contract between `imap_context` and the command files; splitting it would scatter a single invariant set. Coupled-group exception. |
 | `imap/detail/response_parser.h` | 350–400 | Shallow parse only by design (ENVELOPE/BODYSTRUCTURE deep parse lives in `detail/fetch_parse.h`). The resp-code atom table, if it proves non-templatable, moves to `src/imap/detail/response_parser.cpp`. |
 | `command/fetch_command.h` family | 200–260 each | Deep BODYSTRUCTURE/ENVELOPE parsing is shared through `imap/detail/fetch_parse.h` (created on evidence, as planned); `detail/parse_cursor.h` is its standalone cursor base. |
-| `state/selected.h` | 300–350 | Twelve operation methods, each a thin builder over one command type; the sender glue is a single `detail::state_op_sender` template in `imap/state/detail/state_op_sender.h` shared by all five states (one coupled group, together with `idle_op_sender`). |
+| `state/selected.h` | 300–350 | Twelve operation methods, each a thin builder over one command type; the sender glue is a single `detail::state_op_sender` template in `imap/state/detail/state_op_sender.h` shared by all four states (one coupled group, together with `idle_op_sender`). |
 | `imap/detail/response_lexer.h` | ~150 | Single-purpose cursor; no control needed. |
 
 The coupled-types exception of code_style.md is exercised deliberately in
 `response.h` (six wire types that only make sense together),
 `unsolicited_event.h` (the seven-event variant set), `session_state.h`
-(five forward declarations, D9), `operation_base.h` and
+(four forward declarations, D9), `operation_base.h` and
 `imap/detail/fetch_parse.h`. No other sharing is planned.
 
 ## 5. Naming master table
@@ -515,7 +514,7 @@ std::allocator<std::byte>` unless marked non-template. Namespace is
 | `submit<Operation>(args...)` | sender convenience overload (D1): lazy sender of `set_value(ec, Operation::result_type)` / `set_stopped()` |
 | `submit(vector<unique_ptr<imap_command<A>>>)` | `vector<string_type>` — erased batch, tags in vector order |
 | `flush()` | one batched `async_write` of the pending queue |
-| `cancel(tag)` | three-granularity per D3; IDLE cancel sends DONE first |
+| `cancel(tag)` | three-granularity per D3; IDLE cancel queues DONE (asynchronous, needs a live io_context) |
 | `on_unsolicited(f)` | `template <class F> detail::registration on_unsolicited(F&&)` — one handler for the whole `unsolicited_event` variant |
 | `set_io_context(ioc)` / `io_context()` | borrowing rules per architecture §3.6 |
 | `is_alive()` / `close()` | close protocol per architecture §3.7 |
@@ -576,14 +575,11 @@ three live states with successor = same state / same state / `logout_state`.
 | `authenticated_state<A>` | `select(mailbox)` / `examine(mailbox)` → `selected_state` on OK / **retained** `authenticated_state` on NO/failure (two signatures, D9) · `list(ref, pattern)` → same (`vector<mailbox_entry>`) · `status(mailbox, items)` → same (`mailbox_status`) · `create/delete_mailbox/rename/subscribe/unsubscribe` → same · `append(mailbox, mail, flags)` → same · `capability()` / `noop()` → same · `logout()` → `logout_state` |
 | `selected_state<A>` | `mailbox() const -> const mailbox_info<A>&` (not an operation) · `fetch_envelopes(seq)` → same (`vector<envelope>`) · `fetch_headers(seq, fields)` → same (`vector<mail_header>`) · `fetch_message(seq)` → same (`vector<mail>`) · `fetch(seq, items)` → same (`vector<message_attributes>`) · `search(criteria)` → same (`vector<uint32_t>`) · `store(seq, flags, store_mode)` → same · `copy(seq, mailbox)` → same · `move(seq, mailbox)` → same · `expunge()` → same · `close()` → `authenticated_state` · `idle()` → `selected_state` (drives an IDLE/DONE cycle internally; heartbeat per usage.md §2.6) · UID variants `uid_fetch_envelopes`, `uid_fetch_headers`, `uid_fetch_message`, `uid_fetch`, `uid_search`, `uid_store`, `uid_copy`, `uid_move` → same (same result shapes) · `capability()` / `noop()` → same · `logout()` → `logout_state` |
 | `logout_state<A>` | — (terminal) |
-| `idle_state<A>` (command-layer escape + internal) | `on_event(f)`, `done()` → `selected_state`, `stop()` |
 
-Note the deliberate shrink of the public IDLE surface versus
-architecture.md §9: on the state layer `idle()` is one operation that
-returns with the `selected_state` when activity or the heartbeat arrives
-(the usage.md §2.6 loop idiom); the persistent `idle_state` with `on_event`
-remains available through the command layer's `idle_command` and is kept as
-a public type for that audience. Both are the same underlying machinery.
+On the state layer `idle()` is one operation that returns with the
+`selected_state` when activity or the heartbeat arrives (the usage.md
+§2.6 loop idiom); command-layer audiences drive `idle_command` directly
+(architecture.md §9).
 
 `imap_connection<A>`: `variant`-owning context holder (TCP/TLS), capability
 cache (`capabilities()`), `close()`, idle-only move. Created only by

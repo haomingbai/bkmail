@@ -178,9 +178,10 @@ class operation_base {
   /// (literal / SASL wall).
   [[nodiscard]] virtual bool awaits_continuation() const noexcept = 0;
 
-  /// Advisory pipelining wall (AUTHENTICATE / LOGOUT / STARTTLS /
-  /// IDLE-style commands): nothing behind this operation is staged in
-  /// the same batch.
+  /// Advisory pipelining wall (AUTHENTICATE / LOGOUT / STARTTLS declare
+  /// it): nothing behind this operation is staged in the same batch.
+  /// IDLE needs no flag here: its wall is the `+ idling` continuation
+  /// wait, which `awaits_continuation()` already expresses.
   [[nodiscard]] virtual bool blocks_pipeline() const noexcept = 0;
 
   /// The write pump staged `next_segment()` into the batch. Until
@@ -198,6 +199,14 @@ class operation_base {
   /// must never extract such an operation from the queue: the in-flight
   /// write still references it.
   [[nodiscard]] virtual bool is_staged() const noexcept = 0;
+
+  /// True once any segment of this operation has been flushed to the
+  /// wire. Unlike `is_written()` (a live check that reverts as new
+  /// segments render), this never reverts: cancellation and teardown
+  /// decisions use it to tell "queued, never staged" apart from
+  /// "already wrote something" — e.g. a second cancel of an IDLE whose
+  /// DONE segment is queued-but-unstaged must not extract the cell.
+  [[nodiscard]] virtual bool has_written() const noexcept { return false; }
 
   // --- read side -----------------------------------------------------
 
@@ -292,9 +301,12 @@ struct op_deleter {
  * `f(std::error_code, result_type)` (or `f(std::error_code)` for `void`
  * results) — the callback path — or a bexec receiver accepting
  * `set_value(std::error_code[, result_type])` / `set_stopped()` — the
- * sender path. The callback path maps stop-cancellation to
- * `std::errc::operation_canceled`, since plain handlers have no stopped
- * channel.
+ * sender path. Stop-cancellation never maps to
+ * `std::errc::operation_canceled` on the callback path: a cancelled
+ * callback-path handler is NEVER invoked (`deliver_stopped`, usage.md
+ * §3.3 — `ctx.cancel(tag)` withdraws the handler), because a plain
+ * handler has no stopped channel to report through; the sender path
+ * completes with `set_stopped()`.
  *
  * Exactly one terminal delivery (`on_tagged` / `fail` /
  * `complete_stopped`) wins, guarded by an atomic exchange; the stop
@@ -366,6 +378,7 @@ class operation_model final
 
   void on_segment_flushed() noexcept override {
     segment_staged_ = false;
+    has_written_ = true;
     command_.on_segment_flushed();
   }
 
@@ -381,6 +394,10 @@ class operation_model final
 
   [[nodiscard]] bool is_staged() const noexcept override {
     return segment_staged_;
+  }
+
+  [[nodiscard]] bool has_written() const noexcept override {
+    return has_written_;
   }
 
   // --- read side -----------------------------------------------------
@@ -560,6 +577,7 @@ class operation_model final
   std::optional<stop_callback_type> stop_callback_;
   // Accessed only under the context mutex (pump and cancel paths).
   bool segment_staged_ = false;
+  bool has_written_ = false;
   bool detached_ = false;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> stop_seen_{false};
@@ -678,6 +696,40 @@ template <class Allocator, class Sender, class MakeReceiver>
     throw;
   }
   return mem;
+}
+
+/**
+ * Allocates and starts a self-owning I/O box from a sender factory —
+ * the standard pump arming sequence, shared by every arming site.
+ *
+ * Sequencing contract (the reason this wrapper exists): `make_sender`
+ * is invoked FIRST, as a statement of its own, and only then is the
+ * box allocated with `make_receiver`. The receiver factory usually
+ * takes ownership of the caller's `core` shared_ptr; if the sender
+ * were materialized as an argument of the same call expression as the
+ * receiver-factory lambda, an unspecified argument evaluation order
+ * could initialize that lambda's capture (and run its body, producing
+ * the receiver) before the sender existed — and the sender-producing
+ * arguments would then dereference a moved-from (null) shared_ptr.
+ * Evaluating the sender as a separate statement removes the hazard by
+ * construction.
+ *
+ * Capture rules for call sites: the sender factory runs exactly once,
+ * synchronously, before `make_receiver` is invoked, so it may capture
+ * the caller's shared state by reference; a receiver factory that
+ * transfers ownership must capture that state by value and move it at
+ * invocation time (an init-capture move would already run at the call
+ * site, before `make_sender`).
+ */
+template <class Allocator, class MakeSender, class MakeReceiver>
+io_box_base* start_io_box(const Allocator& alloc, MakeSender&& make_sender,
+                          MakeReceiver&& make_receiver) {
+  // Sender first: see the sequencing contract above.
+  auto sender = make_sender();
+  io_box_base* box = make_io_box(alloc, std::move(sender),
+                                 std::forward<MakeReceiver>(make_receiver));
+  box->start();
+  return box;
 }
 
 /// Minimal compile-time contract check for command types; the full

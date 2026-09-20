@@ -1,6 +1,6 @@
 /**
  * @file session_state.h
- * @brief Forward declarations of the five Layer-2 session states.
+ * @brief Forward declarations of the four Layer-2 session states.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
  *
@@ -14,7 +14,7 @@
 
 namespace bkmail::imap {
 
-// The five Layer-2 session states (see imap/state/*.h). They form one
+// The four Layer-2 session states (see imap/state/*.h). They form one
 // coupled group: every operation consumes its state by rvalue and delivers
 // the successor state for the observed server outcome through its sender —
 // one set_value signature per successor, never a merged variant (variant
@@ -28,8 +28,6 @@ template <class Allocator>
 class selected_state;
 template <class Allocator>
 class logout_state;
-template <class Allocator>
-class idle_state;
 
 }  // namespace bkmail::imap
 

@@ -34,6 +34,11 @@
  *    an operation (buffer stability, architecture §2.5).
  *  - An operation paused on a continuation request (literal/SASL) is a
  *    wall: nothing behind it is staged (RFC 3501 §5.5 wire order).
+ *  - The continuation route (`continuation_target_`) is registered at
+ *    STAGING time, not at write completion: io_uring orders no
+ *    completions across operation types, so the server's `+` answer can
+ *    be dispatched before the write CQE is reaped. The assignment in
+ *    the completion handler is an idempotent re-assertion.
  *  - A write error is connection-fatal: it funnels into
  *    `context_core::connection_lost`.
  */
@@ -84,24 +89,28 @@ class write_pump {
       core->kick_posted_ = true;
     }
     try {
-      // Materialize the allocator and the sender before the receiver
-      // factory: capturing `core` by move initializes the lambda as an
-      // argument of the same call, and with an unspecified argument
-      // evaluation order the other arguments would dereference a
-      // moved-from (null) shared_ptr. The lambda copies the shared_ptr
-      // so the catch path below still owns the core.
-      auto alloc = core->get_allocator();
-      auto sender = bexec::schedule(core->scheduler());
-      auto* box = make_io_box(std::move(alloc), std::move(sender),
-                              [core](io_box_base* self) mutable {
-                                return kick_receiver(self, std::move(core));
-                              });
-      box->start();
+      // start_io_box materializes the sender before the receiver
+      // factory runs (the sequencing hazard the wrapper exists for).
+      // The receiver factory copy-captures `core` so the catch path
+      // below still owns its own reference even after the receiver
+      // took over.
+      start_io_box(
+          core->get_allocator(),
+          [&core] { return bexec::schedule(core->scheduler()); },
+          [core](io_box_base* self) mutable {
+            return kick_receiver(self, std::move(core));
+          });
     } catch (...) {
-      // Allocation failure: unlatch so a later submission re-kicks; the
-      // queued operations stay pending.
-      std::lock_guard lock(core->mutex_);
-      core->kick_posted_ = false;
+      // Allocation failure: with no scheduler slot nothing will ever
+      // drain the queue, so a silent unlatch would stall the pending
+      // operations forever. Unlatch, then tear the connection down —
+      // matching kick()'s own arm-failure behavior. The catch path
+      // still owns `core`.
+      {
+        std::lock_guard lock(core->mutex_);
+        core->kick_posted_ = false;
+      }
+      core->connection_lost(std::make_error_code(std::errc::not_enough_memory));
     }
   }
 
@@ -139,10 +148,20 @@ class write_pump {
                                   first + segment.size());
         op->on_segment_staged();
         staged.push_back(op);
+        const bool awaits_continuation = op->awaits_continuation();
+        if (awaits_continuation) {
+          // CI fix (io_uring orders no completions across operation
+          // types): a `+` continuation answering these bytes can be
+          // dispatched BEFORE this write's completion is reaped, so the
+          // continuation route must exist from staging time, not from
+          // flush time. At most one waiter per drain: the wall stops
+          // staging behind it. on_write_done only re-asserts this.
+          ctx.continuation_target_ = op;
+        }
         // Staged the "{n}\r\n" line of a literal operation, or a
         // pipeline-blocking command (AUTHENTICATE / LOGOUT / STARTTLS):
         // the wall drops behind it.
-        if (op->awaits_continuation() || op->blocks_pipeline()) {
+        if (awaits_continuation || op->blocks_pipeline()) {
           break;
         }
       }
@@ -233,68 +252,72 @@ class write_pump {
 
   /// Arms the single write-all operation over the staging buffer.
   ///
-  /// Runs entirely under the core mutex: the phase decision and the
-  /// registration of the armed write (the scripted stream records the
-  /// armed write inside start()) form one critical section, so a
-  /// concurrent abandon() either observes the armed write in its
-  /// teardown delivery or wins the mutex first and this arm unwinds
-  /// instead — the teardown completion is delivered exactly once under
-  /// every interleaving. The mutex is recursive because an
-  /// eagerly-completed write re-enters on_write_done on the same thread.
+  /// The phase decision and the registration of the armed write (the
+  /// scripted stream records the armed write inside start()) form one
+  /// critical section under the core mutex, so a concurrent abandon()
+  /// either observes the armed write in its teardown delivery or wins
+  /// the mutex first and this arm unwinds instead — the teardown
+  /// completion is delivered exactly once under every interleaving.
+  /// The mutex is recursive because an eagerly-completed write re-enters
+  /// on_write_done on the same thread. The teardown branch extracts the
+  /// staged cells under the lock but completes (fails or silently
+  /// drops) them outside it — user completion code never runs under the
+  /// core mutex.
   static void arm(
       std::shared_ptr<core_type> core,
       std::vector<operation_type*, rebind_alloc_t<Allocator, operation_type*>>
           staged) {
     using cell_type = typename core_type::cell_type;
-    std::lock_guard lock(core->mutex_);
-    if (core->phase_ != core_type::phase::open ||
-        core->abandoned_.load(std::memory_order_acquire)) {
-      // Teardown won the race between kick()'s decision and this arm:
-      // the staged cells were kept in the queue for this write's
-      // completion, which will now never happen — retire them the way
-      // the write completion would have. During abandonment they are
-      // destroyed silently (handlers dropped, not invoked); during a
-      // close() drain they are failed with the cancellation code, like
-      // every other queued operation.
-      const bool abandoned = core->abandoned_.load(std::memory_order_acquire);
-      std::vector<cell_type, rebind_alloc_t<Allocator, cell_type>> retired{
-          rebind_alloc_t<Allocator, cell_type>(core->get_allocator())};
-      for (auto* op : staged) {
-        if (auto cell = core->extract_from_queue_locked(op)) {
-          retired.push_back(std::move(cell));
+    // Cells the teardown branch retires: extracted under the lock,
+    // completed outside it (same shape as on_write_done).
+    std::vector<cell_type, rebind_alloc_t<Allocator, cell_type>> retired{
+        rebind_alloc_t<Allocator, cell_type>(core->get_allocator())};
+    bool abandoned = false;
+    {
+      std::lock_guard lock(core->mutex_);
+      if (core->phase_ != core_type::phase::open ||
+          core->abandoned_.load(std::memory_order_acquire)) {
+        // Teardown won the race between kick()'s decision and this arm:
+        // the staged cells were kept in the queue for this write's
+        // completion, which will now never happen — extract them the
+        // way the write completion would have and retire them after the
+        // lock is released. During abandonment they are destroyed
+        // silently (handlers dropped, not invoked); during a close()
+        // drain they are failed with the cancellation code, like every
+        // other queued operation.
+        abandoned = core->abandoned_.load(std::memory_order_acquire);
+        for (auto* op : staged) {
+          if (auto cell = core->extract_from_queue_locked(op)) {
+            retired.push_back(std::move(cell));
+          }
         }
-      }
-      core->write_in_flight_ = false;
-      if (abandoned) {
-        retired.clear();
+        core->write_in_flight_ = false;
       } else {
-        for (auto& cell : retired) {
-          cell->fail(std::make_error_code(std::errc::operation_canceled));
-        }
-        retired.clear();
+        start_io_box(
+            core->get_allocator(),
+            [&core] {
+              return core->stream_.async_write(
+                  core->scheduler(),
+                  bnio::const_buffer(core->write_staging_.data(),
+                                     core->write_staging_.size()),
+                  MSG_NOSIGNAL);
+            },
+            [core, staged = std::move(staged)](io_box_base* self) mutable {
+              return write_receiver(self, std::move(core), std::move(staged));
+            });
+        return;
       }
-      core->maybe_finish_close();
-      return;
     }
-    // Materialize the allocator and the sender before the receiver
-    // factory: capturing `core` by move initializes the lambda as an
-    // argument of the same call, and with an unspecified argument
-    // evaluation order the other arguments would dereference a
-    // moved-from (null) shared_ptr. Both also re-enter the core mutex,
-    // which the recursive lock permits.
-    auto alloc = core->get_allocator();
-    auto sender = core->stream_.async_write(
-        core->scheduler(),
-        bnio::const_buffer(core->write_staging_.data(),
-                           core->write_staging_.size()),
-        MSG_NOSIGNAL);
-    auto* box = make_io_box(
-        std::move(alloc), std::move(sender),
-        [core = std::move(core),
-         staged = std::move(staged)](io_box_base* self) mutable {
-          return write_receiver(self, std::move(core), std::move(staged));
-        });
-    box->start();
+    if (abandoned) {
+      // Shell destroyed: no failure delivery, only silent destruction.
+      retired.clear();
+    } else {
+      for (auto& cell : retired) {
+        cell->fail(std::make_error_code(std::errc::operation_canceled));
+      }
+      retired.clear();
+    }
+    core->maybe_finish_close();
   }
 
   /// Write completion: flush notifications, continuation-target
@@ -379,9 +402,12 @@ class write_pump {
             continue;
           }
           op->on_segment_flushed();
-          // The {n} line just hit the wire: this operation is now the
-          // single continuation route (at most one per drain, since the
-          // wall stops staging behind it).
+          // Idempotent re-assertion of the continuation route: kick()
+          // already registered this operation when it staged the bytes,
+          // so the route existed before any `+` answering them could be
+          // dispatched. Nothing can have replaced the target in between
+          // (at most one continuation waiter per drain, since the wall
+          // stops staging behind it).
           if (op->awaits_continuation()) {
             ctx.continuation_target_ = op;
           }

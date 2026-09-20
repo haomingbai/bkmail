@@ -49,6 +49,7 @@ using bkmail::test::fake_imap_server;
 using bkmail::test::io_runner;
 using bkmail::test::kDefaultTimeout;
 using bkmail::test::poll_until;
+using bkmail::test::quiesce_guard;
 using bkmail::test::script_recorder;
 using bkmail::test::scripted_stream;
 using bkmail::test::server_bytes;
@@ -127,6 +128,9 @@ TEST(ErrorPaths, TransportErrorFailsPendingHandler) {
                search_ec = ec;
                search_done.arrive();
              });
+  // Covers every early return below: the io worker must have left the
+  // handler call chain before the locals it references die.
+  quiesce_guard teardown{runner};
   ctx.flush();
 
   ASSERT_TRUE(search_done.wait_for(kDefaultTimeout));
@@ -153,6 +157,9 @@ TEST(ErrorPaths, ServerHangupFailsPendingHandler) {
     result_ec = ec;
     done.arrive();
   });
+  // Covers every early return below: the io worker must have left the
+  // handler call chain before the locals it references die.
+  quiesce_guard teardown{runner};
   ctx.flush();
 
   ASSERT_TRUE(done.wait_for(kDefaultTimeout));
@@ -261,6 +268,10 @@ TEST(ErrorPaths, StopTokenCancelsInFlightOperation) {
       std::move(selected).search("ALL"),
       search_receiver{stop_src.get_token(), stopped, value_calls});
   bexec::start(op);
+  // Covers every early return below: the io worker must have left the
+  // receiver call chain before the stack-allocated operation state and
+  // receiver go out of scope.
+  quiesce_guard teardown{runner};
 
   // Cancel once the command is on the wire (written, awaiting the reply).
   ASSERT_TRUE(server.wait_received("SEARCH", kDefaultTimeout));
@@ -271,9 +282,6 @@ TEST(ErrorPaths, StopTokenCancelsInFlightOperation) {
   EXPECT_EQ(0, value_calls.load());
 
   EXPECT_TRUE(server.wait_done(kDefaultTimeout));
-  // Barrier: the io worker must have left the receiver call chain before
-  // the stack-allocated operation state and receiver go out of scope.
-  runner.quiesce();
 }
 
 }  // namespace

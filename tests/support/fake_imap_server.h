@@ -293,7 +293,12 @@ class fake_imap_server {
         std::lock_guard lock(mutex_);
         const std::size_t pos = received_.find(needle, search_cursor_);
         if (pos != std::string::npos) {
-          capture_tag_locked(pos);
+          // A match inside client literal payload is message data, not a
+          // command line: its line's first token may coincidentally be
+          // tag-shaped, which would corrupt last_tag_ (audit finding 4).
+          if (!pos_inside_literal_locked(pos)) {
+            capture_tag_locked(pos);
+          }
           search_cursor_ = pos + needle.size();
           return true;
         }
@@ -330,15 +335,20 @@ class fake_imap_server {
       if (n <= 0) {
         return false;  // Orderly close (0) or error: the client went away.
       }
-      std::lock_guard lock(mutex_);
-      received_.append(buf, static_cast<std::size_t>(n));
-      cv_.notify_all();
+      {
+        std::lock_guard lock(mutex_);
+        received_.append(buf, static_cast<std::size_t>(n));
+        track_literals_locked();
+        cv_.notify_all();
+      }
     }
   }
 
   /// Captures the tag of the command line containing the match at @p pos.
-  /// Lines whose first token is not tag-shaped (e.g. "DONE" or literal data)
-  /// leave the previous tag untouched.
+  /// Lines whose first token is not tag-shaped (e.g. "DONE" or literal
+  /// data) leave the previous tag untouched. Callers must exclude matches
+  /// inside literal payload (pos_inside_literal_locked): such lines are
+  /// message data and may carry a tag-shaped first token by coincidence.
   void capture_tag_locked(std::size_t pos) {
     std::size_t line_start = received_.rfind("\r\n", pos);
     line_start = (line_start == std::string::npos) ? 0 : line_start + 2;
@@ -359,6 +369,71 @@ class fake_imap_server {
     if (tag_shaped && has_digit) {
       last_tag_ = token;
     }
+  }
+
+  /// Scans newly arrived client bytes for synchronizing-literal
+  /// announcements — lines ending in "{N}\r\n" (APPEND's wire form) — and
+  /// records the N following bytes as literal payload. The payload itself
+  /// is never scanned: a "{N}\r\n"-lookalike inside a message body cannot
+  /// corrupt the tracking. Inline "{N+}" literals (LITERAL+) are not
+  /// tracked; no current script matches a needle inside one. Called under
+  /// the mutex after received_ grew.
+  void track_literals_locked() {
+    std::size_t pos = scanned_;
+    while (pos < received_.size()) {
+      const std::size_t eol = received_.find("\r\n", pos);
+      if (eol == std::string::npos) {
+        break;  // Trailing line still incomplete: rescan later.
+      }
+      std::size_t literal_size = 0;
+      if (parse_literal_announcement_locked(pos, eol, literal_size)) {
+        const std::size_t payload = eol + 2;
+        literal_ranges_.emplace_back(payload, payload + literal_size);
+        // The payload is never scanned — even while it is still arriving
+        // (scanned_ may then sit past received_.size() until it is).
+        pos = payload + literal_size;
+      } else {
+        pos = eol + 2;
+      }
+    }
+    scanned_ = pos;
+  }
+
+  /// True when the line spanning [line_start, eol) ends in "{N}\r\n";
+  /// on success @p n holds the announced literal byte count.
+  bool parse_literal_announcement_locked(std::size_t line_start,
+                                         std::size_t eol,
+                                         std::size_t& n) const {
+    if (eol == line_start || received_[eol - 1] != '}') {
+      return false;
+    }
+    const std::size_t open = received_.rfind('{', eol - 1);
+    if (open == std::string::npos || open < line_start || open + 2 > eol - 1) {
+      return false;
+    }
+    n = 0;
+    for (std::size_t i = open + 1; i < eol - 1; ++i) {
+      const char c = received_[i];
+      if (!std::isdigit(static_cast<unsigned char>(c))) {
+        return false;
+      }
+      n = n * 10 + static_cast<std::size_t>(c - '0');
+      if (n > kMaxTrackedLiteral) {
+        n = kMaxTrackedLiteral;
+      }
+    }
+    return true;
+  }
+
+  /// Whether @p pos falls inside a recorded literal payload. Callers must
+  /// hold the mutex.
+  [[nodiscard]] bool pos_inside_literal_locked(std::size_t pos) const {
+    for (const auto& range : literal_ranges_) {
+      if (pos >= range.first && pos < range.second) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// Replaces `{tag}` with the most recently captured command tag. Sets
@@ -432,10 +507,11 @@ class fake_imap_server {
   }
 
   void finish() {
-    {
-      std::lock_guard lock(mutex_);
-      done_ = true;
-    }
+    // Notified under the lock: a waiter returns from its wait holding the
+    // mutex, so this notify has already returned before the waiter's
+    // thread can destroy the cv (mirrors signal_event::arrive).
+    std::lock_guard lock(mutex_);
+    done_ = true;
     cv_.notify_all();
   }
 
@@ -477,6 +553,18 @@ class fake_imap_server {
   std::string last_tag_;
   std::string errors_;
   bool done_ = false;
+
+  /// Saturation bound for a parsed "{N}" literal announcement; a real
+  /// announcement never approaches it, the cap only keeps a corrupt
+  /// multi-digit lookalike from overflowing the size_t arithmetic.
+  static constexpr std::size_t kMaxTrackedLiteral = std::size_t{1} << 30;
+
+  /// [begin, end) byte ranges of client-sent literal payload, in arrival
+  /// order (track_literals_locked). Needle matches inside a range are
+  /// message data and must not capture a tag.
+  std::vector<std::pair<std::size_t, std::size_t>> literal_ranges_;
+  /// Prefix of received_ already scanned for literal announcements.
+  std::size_t scanned_ = 0;
 };
 
 }  // namespace bkmail::test

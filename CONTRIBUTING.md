@@ -42,13 +42,16 @@ find include src tests examples -type f \
 ```
 
 To verify without modifying files, replace `-i` with `--dry-run --Werror`.
-CI runs exactly this check and fails on any diff.
+CI runs exactly this check and reports any diff in the job log; the job is
+continue-on-error, so a formatting diff does not fail the build — fix it
+anyway before review.
 
 ## Pull requests
 
 - Keep changes focused; one logical change per PR.
 - Follow [docs/code_style.md](docs/code_style.md): file banners, naming,
   include order, one-type-per-file, allocator support.
-- Ensure the CI matrix (Linux/macOS × Debug/Release + format check) is
-  green.
+- Ensure the CI matrix (Linux/macOS × Debug/Release × gcc/clang, with gcc
+  excluded on macOS, plus a separate ASan+UBSan job) is green. The format
+  check reports diffs but does not fail the build.
 - Write commit messages in English, imperative mood, explaining *why*.

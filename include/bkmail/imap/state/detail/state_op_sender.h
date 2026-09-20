@@ -20,7 +20,14 @@
  *  - every failure rides the value channel as std::error_code (no
  *    set_error); cancellation completes with set_stopped();
  *  - the receiver's stop token is obtained from its environment and
- *    forwarded to Layer 1 as imap_context::cancel(tag).
+ *    forwarded to Layer 1 as imap_context::cancel(tag), and the stopped
+ *    completion itself is delivered from the context's dispatch path
+ *    (post_stopped_delivery) — never inline on the thread that requested
+ *    the stop.
+ *
+ * The file also hosts the shared operation-state glue: stop_callback_box
+ * (dedup C1), guarded_timer_receiver (dedup C3), the shared successor
+ * factories (dedup C6) and the complete_with delivery tail (dedup C7).
  */
 
 #pragma once
@@ -29,11 +36,13 @@
 
 #include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/common/error.h>
+#include <bkmail/imap/capability_set.h>
 #include <bkmail/imap/command/idle_command.h>
 #include <bkmail/imap/detail/unsolicited_table.h>
 #include <bkmail/imap/imap_connection.h>
 #include <bkmail/imap/imap_context.h>
 #include <bkmail/imap/mailbox_info.h>
+#include <bkmail/imap/session_state.h>
 #include <bkmail/imap/unsolicited_event.h>
 #include <bnio/io_context.h>
 
@@ -43,6 +52,7 @@
 #include <bexec/operation_state.hpp>
 #include <bexec/query.hpp>
 #include <bexec/receiver.hpp>
+#include <bexec/scheduler.hpp>
 #include <bexec/sender.hpp>
 #include <bexec/stop_token.hpp>
 #include <cassert>
@@ -182,6 +192,238 @@ struct state_op_traits<false, Allocator, Command,
       bexec::set_stopped_t()>;
 };
 
+// ---- Shared operation-state glue ----------------------------------------
+
+/**
+ * Terminal delivery tail shared by the Layer-2 operation states (dedup
+ * C7): a branching factory (branch_on_error) picks its branch on the
+ * error code; a plain factory maps every completion to its single
+ * successor; a pair-valued bundle (resultful query operations) is
+ * unwrapped so the result rides the value channel next to the error code.
+ *
+ * @param make_successor the operation's successor factory
+ * @param receiver       the operation state's receiver, consumed here
+ * @param ec             the completion's error code
+ * @param args           the remaining factory arguments (connection,
+ *                       result, snapshot — factory-shaped)
+ */
+template <class MakeSuccessor, class Receiver, class... Args>
+void complete_with(MakeSuccessor& make_successor, Receiver& receiver,
+                   std::error_code ec, Args&&... args) noexcept {
+  if constexpr (is_error_branch_v<MakeSuccessor>) {
+    if (!ec) {
+      bexec::set_value(
+          std::move(receiver), ec,
+          make_successor.on_value(ec, std::forward<Args>(args)...));
+    } else {
+      bexec::set_value(
+          std::move(receiver), ec,
+          make_successor.on_error(ec, std::forward<Args>(args)...));
+    }
+  } else {
+    auto bundle = make_successor(ec, std::forward<Args>(args)...);
+    if constexpr (is_result_bundle<decltype(bundle)>::value) {
+      bexec::set_value(std::move(receiver), ec, std::move(bundle.first),
+                       std::move(bundle.second));
+    } else {
+      bexec::set_value(std::move(receiver), ec, std::move(bundle));
+    }
+  }
+}
+
+// Shared successor factories (dedup C6). The session states hand these to
+// state_op_sender so the per-state lambdas stay single-sourced. They are
+// templates: the state types they name are only forward-declared here
+// (session_state.h) and complete at instantiation inside the state
+// headers, after their definitions.
+
+/// Successor factory for void-result operations that keep the session in
+/// @p State (NOOP-style): every non-stopped completion rebuilds @p State
+/// over the returned connection.
+template <class State, class Allocator>
+[[nodiscard]] auto same_state_successor() {
+  return [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
+    return State{std::move(conn)};
+  };
+}
+
+/// Successor factory for LOGOUT: the connection's teardown is detained
+/// (see detain_connection) and the terminal state is yielded.
+template <class Allocator>
+[[nodiscard]] auto logout_successor() {
+  return [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
+    // The completion runs inside the read dispatch; the connection's
+    // destruction is detained to after the dispatch unwinds.
+    detain_connection(std::move(conn));
+    return logout_state<Allocator>{};
+  };
+}
+
+/// Successor factory for CAPABILITY: refreshes the connection's
+/// capability cache on success and hands the (capability_set, state) pair
+/// back, with @p inner rebuilding the successor state.
+template <class Allocator, class Inner>
+[[nodiscard]] auto capability_successor(Inner inner) {
+  return [inner = std::move(inner)](std::error_code ec,
+                                    imap_connection<Allocator> conn,
+                                    capability_set<Allocator> caps) mutable {
+    if (!ec) {
+      conn.set_capabilities(caps);
+    }
+    return std::pair{std::move(caps), inner(ec, std::move(conn))};
+  };
+}
+
+/// Successor branch pair for LOGIN/AUTHENTICATE-class operations: OK
+/// advances to Authenticated, anything else retains the
+/// Not-Authenticated state.
+template <class Allocator>
+[[nodiscard]] auto auth_branches() {
+  return branch_on_error(
+      [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
+        return authenticated_state<Allocator>{std::move(conn)};
+      },
+      [](std::error_code /*ec*/, imap_connection<Allocator> conn) {
+        return not_authenticated_state<Allocator>{std::move(conn)};
+      });
+}
+
+/// Successor branch pair for SELECT/EXAMINE: OK folds the mailbox_info
+/// snapshot into the Selected state, failure keeps the session
+/// Authenticated (a failed SELECT selects no mailbox, RFC 3501).
+template <class Allocator>
+[[nodiscard]] auto select_branches() {
+  return branch_on_error(
+      [](std::error_code /*ec*/, imap_connection<Allocator> conn,
+         mailbox_info<Allocator> info) {
+        return selected_state<Allocator>{std::move(conn), std::move(info)};
+      },
+      [](std::error_code /*ec*/, imap_connection<Allocator> conn,
+         mailbox_info<Allocator> /*info*/) {
+        return authenticated_state<Allocator>{std::move(conn)};
+      });
+}
+
+/**
+ * Stop-callback plumbing shared by every Layer-2 operation state (dedup
+ * C1): derives the environment/stop-token/callback types for @p Forwarder
+ * from @p Receiver and wraps the callback in an optional with the
+ * emplace/reset choreography.
+ */
+template <class Receiver, class Forwarder>
+class stop_callback_box {
+ public:
+  using env_type = decltype(bexec::get_env(std::declval<const Receiver&>()));
+  using stop_token_type =
+      decltype(bexec::get_stop_token(std::declval<const env_type&>()));
+  using stop_callback_type =
+      typename stop_token_type::template callback_type<Forwarder>;
+
+  /// Registers @p forwarder for @p token; a token that is already
+  /// cancelled fires the callback inline before emplace returns.
+  void emplace(const stop_token_type& token, Forwarder forwarder) {
+    callback_.emplace(token, std::move(forwarder));
+  }
+
+  /// Unregisters the callback; bexec-verified safe to call from within
+  /// the callback itself.
+  void reset() noexcept { callback_.reset(); }
+
+ private:
+  std::optional<stop_callback_type> callback_;
+};
+
+/**
+ * Self-owning timer-wait receiver (io_box), shared by watchdog-style
+ * timers (dedup C3): the wait's completion may be queued by cancel()
+ * AFTER the owning operation state died, so @p on_fire may only run
+ * while the shared completed flag says the owner never completed.
+ */
+template <class OnFire>
+struct guarded_timer_receiver {
+  io_box_base* box;
+  std::shared_ptr<std::atomic<bool>> completed;
+  OnFire on_fire;
+
+  void set_value(std::error_code ec) noexcept {
+    io_box_base* self = box;
+    if (!ec && !completed->load(std::memory_order_acquire)) {
+      on_fire();
+    }
+    self->dispose();
+  }
+
+  void set_stopped() noexcept { box->dispose(); }
+};
+
+/**
+ * Receiver of a posted stopped-delivery task (see
+ * post_stopped_delivery): the poster already won the operation's
+ * completed_ exchange, so this task is the operation's sole remaining
+ * completion and moves the receiver out of the operation state.
+ */
+template <class Receiver>
+struct stopped_delivery_receiver {
+  io_box_base* box;
+  Receiver* receiver;  // into the operation state; see liveness below
+  std::shared_ptr<std::atomic<bool>> completed;  // the poster's claim
+
+  void set_value(std::error_code) noexcept {
+    // Liveness: the operation state is destroyed only by its completion;
+    // after the poster won the completed_ exchange, no other path can
+    // complete (every rival completion point exchange-loses and returns
+    // without touching the state), so the state — and with it *receiver —
+    // is still alive here and the receiver may be moved out.
+    assert(completed->load(std::memory_order_acquire));
+    bexec::set_stopped(std::move(*receiver));
+    box->dispose();
+  }
+
+  void set_stopped() noexcept {
+    // The io_context drained without running the task: the operation can
+    // never complete — the same accepted leak as detain_connection.
+    box->dispose();
+  }
+};
+
+/**
+ * Delivers a Layer-2 operation's stopped completion from the io_context's
+ * dispatch path (contract §6: receivers are only ever completed from the
+ * context's dispatch path — never inline on the thread that requested the
+ * stop). The caller must have won the operation's completed_ exchange and
+ * finished its synchronous bookkeeping (tag cancel, finish_operation,
+ * stop-callback reset, timer cancel); everything else rides the posted,
+ * self-owning io_box task.
+ *
+ * Liveness: the operation state is destroyed only by its completion, and
+ * after the completed_ exchange was won no other path can complete (every
+ * rival completion point exchange-loses and returns without touching the
+ * state) — the posted task is the operation's sole remaining completion,
+ * so the state is still alive when the task runs and the task may safely
+ * move @p receiver (the operation state's member) out.
+ *
+ * Should the io_context never run again, the task — and with it the
+ * completion — never runs; the same accepted leak as detain_connection.
+ * On allocation failure the delivery falls back to inline completion: a
+ * hung consumer is worse than a bent contract under OOM.
+ */
+template <class Allocator, class Receiver>
+void post_stopped_delivery(
+    const Allocator& alloc, bnio::io_context& ioc, Receiver& receiver,
+    std::shared_ptr<std::atomic<bool>> completed) noexcept {
+  try {
+    auto* box = make_io_box(
+        alloc, bexec::schedule(ioc.get_post_scheduler()),
+        [&receiver, completed = std::move(completed)](io_box_base* self) {
+          return stopped_delivery_receiver<Receiver>{self, &receiver,
+                                                     std::move(completed)};
+        });
+    box->start();
+  } catch (...) {
+    bexec::set_stopped(std::move(receiver));
+  }
+}
+
 /**
  * Operation state behind state_op_sender (pinned, single-start).
  *
@@ -249,9 +491,10 @@ class state_op_operation {
       connection_.finish_operation();
       const auto ec = make_error_code(errc::capability_required);
       if constexpr (has_result) {
-        finish(ec, result_type{});
+        complete_with(make_successor_, receiver_, ec, std::move(connection_),
+                      result_type{});
       } else {
-        finish(ec);
+        complete_with(make_successor_, receiver_, ec, std::move(connection_));
       }
       return;
     }
@@ -281,91 +524,44 @@ class state_op_operation {
     state_op_operation* op;
 
     void operator()() const noexcept {
-      // Cancel first (drop the reply on arrival / send DONE for IDLE),
-      // then complete; never run the receiver inline twice.
-      if (op->completed_.exchange(true, std::memory_order_acq_rel)) {
+      // Cancel first (drop the reply on arrival), then complete; never
+      // run the receiver inline twice.
+      if (op->completed_->exchange(true, std::memory_order_acq_rel)) {
         return;
       }
       op->connection_.with_context(
           [tag = op->tag_](auto& ctx) mutable { ctx.cancel(tag); });
       op->connection_.finish_operation();
-      bexec::set_stopped(std::move(op->receiver_));
+      op->stop_callback_.reset();
+      // §6 contract: the receiver is completed from the context's
+      // dispatch path, never inline on the requesting thread.
+      post_stopped_delivery(op->connection_.get_allocator(),
+                            op->connection_.io_context(), op->receiver_,
+                            op->completed_);
     }
   };
 
-  using env_type = decltype(bexec::get_env(std::declval<const Receiver&>()));
-  using stop_token_type =
-      decltype(bexec::get_stop_token(std::declval<const env_type&>()));
-  using stop_callback =
-      typename stop_token_type::template callback_type<stop_forwarder>;
-
-  // Terminal delivery, resultful commands. A branching factory picks its
-  // branch on ec; a plain factory maps every completion to its single
-  // successor.
-  template <class Result>
-  void finish(std::error_code ec, Result&& result) noexcept {
-    if constexpr (is_error_branch_v<MakeSuccessor>) {
-      if (!ec) {
-        bexec::set_value(
-            std::move(receiver_), ec,
-            make_successor_.on_value(ec, std::move(connection_),
-                                     std::forward<Result>(result)));
-      } else {
-        bexec::set_value(
-            std::move(receiver_), ec,
-            make_successor_.on_error(ec, std::move(connection_),
-                                     std::forward<Result>(result)));
-      }
-    } else {
-      auto bundle = make_successor_(ec, std::move(connection_),
-                                    std::forward<Result>(result));
-      if constexpr (traits::carries_result) {
-        bexec::set_value(std::move(receiver_), ec, std::move(bundle.first),
-                         std::move(bundle.second));
-      } else {
-        bexec::set_value(std::move(receiver_), ec, std::move(bundle));
-      }
-    }
-  }
-
-  // Terminal delivery, void-result commands (see above).
-  void finish(std::error_code ec) noexcept {
-    if constexpr (is_error_branch_v<MakeSuccessor>) {
-      if (!ec) {
-        bexec::set_value(std::move(receiver_), ec,
-                         make_successor_.on_value(ec, std::move(connection_)));
-      } else {
-        bexec::set_value(std::move(receiver_), ec,
-                         make_successor_.on_error(ec, std::move(connection_)));
-      }
-    } else {
-      bexec::set_value(std::move(receiver_), ec,
-                       make_successor_(ec, std::move(connection_)));
-    }
-  }
-
-  // Member template so the parameter is never declared with type void
-  // when result_type is void (the overload below covers that case).
   template <class R = result_type>
     requires(!std::is_void_v<R>)
   void on_result(std::error_code ec, R result) noexcept {
-    if (completed_.exchange(true, std::memory_order_acq_rel)) {
+    if (completed_->exchange(true, std::memory_order_acq_rel)) {
       return;  // stop won the race; drop the reply.
     }
     stop_callback_.reset();
     connection_.finish_operation();
-    finish(ec, std::move(result));
+    complete_with(make_successor_, receiver_, ec, std::move(connection_),
+                  std::move(result));
   }
 
   template <class R = result_type>
     requires(std::is_void_v<R>)
   void on_result(std::error_code ec) noexcept {
-    if (completed_.exchange(true, std::memory_order_acq_rel)) {
+    if (completed_->exchange(true, std::memory_order_acq_rel)) {
       return;
     }
     stop_callback_.reset();
     connection_.finish_operation();
-    finish(ec);
+    complete_with(make_successor_, receiver_, ec, std::move(connection_));
   }
 
   imap_connection<Allocator> connection_;
@@ -374,8 +570,11 @@ class state_op_operation {
   std::string_view required_capability_;
   Receiver receiver_;
   bkmail::detail::string_of<Allocator> tag_;
-  std::optional<stop_callback> stop_callback_;
-  std::atomic<bool> completed_ = false;
+  stop_callback_box<Receiver, stop_forwarder> stop_callback_;
+  // Shared (like idle_op_operation's) so the posted stopped-delivery task
+  // can hold a flag copy of its own.
+  std::shared_ptr<std::atomic<bool>> completed_ =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 /**
@@ -477,7 +676,9 @@ class idle_op_operation {
     // IDLE is only offered when the server advertised it.
     if (!connection_.capabilities().contains("IDLE")) {
       connection_.finish_operation();
-      finish_with_value(make_error_code(errc::capability_required));
+      complete_with(make_successor_, receiver_,
+                    make_error_code(errc::capability_required),
+                    std::move(connection_), std::move(snapshot_));
       return;
     }
 
@@ -495,14 +696,14 @@ class idle_op_operation {
     // Heartbeat watchdog, bound to the connection's current io_context.
     // The wait is self-owning (io_box): its completion may be queued by
     // cancel() AFTER this operation state was destroyed, so it must not
-    // live inside this object — the receiver guards every touch of `this`
-    // with the shared completed flag.
+    // live inside this object — guarded_timer_receiver guards the wake()
+    // call with the shared completed flag and disposes the box.
     timer_.emplace(connection_.io_context(), kIdleHeartbeat);
-    auto* timer_box =
-        make_io_box(connection_.get_allocator(), timer_->async_wait(),
-                    [this](io_box_base* self) {
-                      return timer_wait_receiver{self, this, completed_};
-                    });
+    auto* timer_box = make_io_box(
+        connection_.get_allocator(), timer_->async_wait(),
+        [this](io_box_base* self) {
+          return guarded_timer_receiver{self, completed_, [this] { wake(); }};
+        });
     timer_box->start();
 
     stop_callback_.emplace(token, stop_forwarder{this});
@@ -520,37 +721,20 @@ class idle_op_operation {
       op->connection_.with_context(
           [tag = op->tag_](auto& ctx) mutable { ctx.cancel(tag); });
       op->cleanup();
-      bexec::set_stopped(std::move(op->receiver_));
+      // §6 contract: the receiver is completed from the context's
+      // dispatch path, never inline on the requesting thread.
+      post_stopped_delivery(op->connection_.get_allocator(),
+                            op->connection_.io_context(), op->receiver_,
+                            op->completed_);
     }
   };
-
-  // Self-owning timer wait receiver (io_box). The wait's completion is
-  // queued by steady_timer::cancel() from cleanup(), possibly AFTER this
-  // operation state died: `op` may only be touched while the shared flag
-  // says the operation never completed, and the box disposes itself.
-  struct timer_wait_receiver {
-    io_box_base* box;
-    idle_op_operation* op;
-    std::shared_ptr<std::atomic<bool>> completed;
-
-    void set_value(std::error_code ec) noexcept {
-      io_box_base* self = box;
-      if (!ec && !completed->load(std::memory_order_acquire)) {
-        op->wake();  // heartbeat point reached: DONE and hand the state back
-      }
-      self->dispose();
-    }
-
-    void set_stopped() noexcept { box->dispose(); }
-  };
-
-  using env_type = decltype(bexec::get_env(std::declval<const Receiver&>()));
-  using stop_token_type =
-      decltype(bexec::get_stop_token(std::declval<const env_type&>()));
-  using stop_callback =
-      typename stop_token_type::template callback_type<stop_forwarder>;
 
   void on_unsolicited(const unsolicited_event<Allocator>& event) noexcept {
+    // Post-completion pushes are dropped before the snapshot is touched:
+    // the completion has already moved snapshot_ out (audit Finding 6).
+    if (completed_->load(std::memory_order_acquire)) {
+      return;
+    }
     std::visit(
         [this](const auto& e) {
           using event_type = std::decay_t<decltype(e)>;
@@ -579,7 +763,8 @@ class idle_op_operation {
     connection_.with_context(
         [tag = tag_](auto& ctx) mutable { ctx.cancel(tag); });
     cleanup();
-    finish_with_value({});
+    complete_with(make_successor_, receiver_, std::error_code{},
+                  std::move(connection_), std::move(snapshot_));
   }
 
   /// Tagged reply of the IDLE command (DONE acknowledged, NO/BAD, or a
@@ -589,7 +774,8 @@ class idle_op_operation {
       return;
     }
     cleanup();
-    finish_with_value(ec);
+    complete_with(make_successor_, receiver_, ec, std::move(connection_),
+                  std::move(snapshot_));
   }
 
   void cleanup() noexcept {
@@ -608,12 +794,6 @@ class idle_op_operation {
     connection_.finish_operation();
   }
 
-  void finish_with_value(std::error_code ec) noexcept {
-    bexec::set_value(
-        std::move(receiver_), ec,
-        make_successor_(ec, std::move(connection_), std::move(snapshot_)));
-  }
-
   imap_connection<Allocator> connection_;
   mailbox_info<Allocator> snapshot_;
   [[no_unique_address]] MakeSuccessor make_successor_;
@@ -621,7 +801,9 @@ class idle_op_operation {
   bkmail::detail::string_of<Allocator> tag_;
   std::optional<bnio::steady_timer> timer_;
   std::optional<registration<Allocator>> unsolicited_reg_;
-  std::optional<stop_callback> stop_callback_;
+  stop_callback_box<Receiver, stop_forwarder> stop_callback_;
+  // Shared so the posted stopped-delivery task and the self-owning timer
+  // receiver can hold a flag copy of their own.
   std::shared_ptr<std::atomic<bool>> completed_;
 };
 

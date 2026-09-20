@@ -9,7 +9,9 @@ guide applies. bkmail follows the same conventions as its sibling libraries
 
 Formatting is enforced mechanically: the repository root `.clang-format`
 contains `BasedOnStyle: Google`. Run `clang-format` over everything you
-touch; CI rejects unformatted code.
+touch; CI runs the same check and reports unformatted files (the job is
+continue-on-error: it flags diffs in its log but does not fail the build —
+reviewers will still ask you to format).
 
 ## File header banner
 

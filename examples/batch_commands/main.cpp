@@ -37,6 +37,8 @@
 
 #include <array>
 #include <atomic>
+#include <bexec/bexec.hpp>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -64,6 +66,29 @@ class io_runner {
   }
 
   [[nodiscard]] bnio::io_context& get() noexcept { return ioc_; }
+
+  // Runs one empty task through the context and waits for it: when this
+  // returns, deferred teardown work scheduled on the io thread (e.g. the
+  // connection detained after LOGOUT) has finished, so exiting right
+  // after cannot cut a pending close short.
+  void quiesce() {
+    class done_receiver {
+     public:
+      explicit done_receiver(std::atomic<bool>& done) noexcept : done_(done) {}
+      void set_value(std::error_code) noexcept { done_.store(true); }
+      void set_stopped() noexcept { done_.store(true); }
+
+     private:
+      std::atomic<bool>& done_;
+    };
+    std::atomic<bool> done{false};
+    auto operation = bexec::connect(ioc_.get_post_scheduler().schedule(),
+                                    done_receiver{done});
+    bexec::start(operation);
+    while (!done.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
 
  private:
   bnio::io_context ioc_;
@@ -253,5 +278,8 @@ int main(int argc, char* argv[]) {
       std::printf("%s\n", line.c_str());
     }
   }
+  // Barrier: let the io thread finish the deferred post-LOGOUT teardown
+  // before the runner's destructor stops the io_context.
+  runner.quiesce();
   return any_failed.load() ? 1 : 0;
 }
