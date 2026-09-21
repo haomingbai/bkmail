@@ -117,8 +117,7 @@ class connect_operation {
         ssl_(ssl),
         alloc_(alloc),
         host_(std::move(host)),
-        service_(std::move(service)),
-        tag_(alloc) {}
+        service_(std::move(service)) {}
 
   connect_operation(const connect_operation&) = delete;
   connect_operation& operator=(const connect_operation&) = delete;
@@ -161,8 +160,13 @@ class connect_operation {
         return;
       }
       op->greeting_registration_.reset();
-      op->connection_->with_context(
-          [tag = op->tag_](auto& ctx) mutable { ctx.cancel(tag); });
+      // Abandon the session before the stopped hand-off: cancel(tag_)
+      // alone would leave a staged CAPABILITY probe attached to the
+      // in-flight write, and a failing write completion would fail its
+      // (handler-capturing-`this`) cell after the consumer destroyed this
+      // operation state. The abandonment protocol retires every cell
+      // silently and switches the pumps into their quiet teardown form.
+      op->connection_.reset();
       op->stop_callback_.reset();
       // §6 contract: the receiver is completed from the context's
       // dispatch path, never inline on the requesting thread.
@@ -224,6 +228,11 @@ class connect_operation {
     }
     if (!completed_->exchange(true, std::memory_order_acq_rel)) {
       stop_callback_.reset();
+      // No-op before the session phase (the member is empty); on the
+      // session phase it runs the abandonment protocol, so the staged
+      // CAPABILITY probe can never invoke its handler after the
+      // hand-off (see complete() for why cancel() alone is not enough).
+      connection_.reset();
       bexec::set_stopped(std::move(receiver_));
     }
     return true;
@@ -307,7 +316,7 @@ class connect_operation {
   /// Arms the Layer-1 context, subscribes for the greeting, and starts
   /// the initial CAPABILITY probe. The session phase is published only
   /// after every moving part is in place, so the stop path can rely on
-  /// greeting_registration_/tag_ whenever it observes it.
+  /// greeting_registration_ whenever it observes it.
   void begin_session() noexcept {
     if constexpr (UseTls) {
       connection_.emplace(std::move(*tls_stream_), *ioc_, alloc_);
@@ -320,11 +329,11 @@ class connect_operation {
           [this](const imap::unsolicited_event<Allocator>& event) {
             on_greeting_event(event);
           }));
-      tag_ = ctx.submit(imap::capability_command<Allocator>{},
-                        [this](std::error_code ec,
-                               imap::capability_set<Allocator> caps) mutable {
-                          on_capability(ec, std::move(caps));
-                        });
+      (void)ctx.submit(imap::capability_command<Allocator>{},
+                       [this](std::error_code ec,
+                              imap::capability_set<Allocator> caps) mutable {
+                         on_capability(ec, std::move(caps));
+                       });
       ctx.flush();
     });
     phase_.store(phase::session, std::memory_order_release);
@@ -373,19 +382,6 @@ class connect_operation {
       return;
     }
     stop_callback_.reset();
-    // Disown the in-flight CAPABILITY probe before delivering: its handler
-    // captures `this`, and the completion lets the consumer destroy this
-    // operation state while the worker is still unwinding (the BYE path
-    // completes inside the greeting dispatch). A cell left registered would
-    // let a racing connection_lost invoke that handler on freed memory —
-    // observed on macOS CI as a second sync_wait completion (double
-    // run_loop::finish()). cancel() extracts or detaches the cell so its
-    // reply/failure is handled without touching `this`; the callback-path
-    // stop-completion it may post never invokes the handler.
-    if (connection_ && !tag_.empty()) {
-      connection_->with_context(
-          [tag = tag_](auto& ctx) mutable { ctx.cancel(tag); });
-    }
     // greeting_registration_ is deliberately NOT reset here: complete()
     // may run inside the unsolicited greeting handler itself (the BYE
     // path), and destroying a registration from within its own dispatch is
@@ -403,8 +399,24 @@ class connect_operation {
             imap::not_authenticated_state<Allocator>{std::move(*connection_)});
       }
     } else {
-      // No session outlives a failed connect: the connection (when the
-      // session phase was reached) dies with this operation state.
+      // Disown the in-flight CAPABILITY probe before delivering: its
+      // handler captures `this`, and the completion lets the consumer
+      // destroy this operation state while the worker is still unwinding
+      // (the BYE path completes inside the greeting dispatch). cancel()
+      // alone is NOT enough here: a probe whose bytes are staged in an
+      // in-flight write is only marked detached, and a failing write
+      // completion then fails the retired cell — invoking that handler on
+      // freed memory (observed on macOS CI as
+      // with_context-on-an-empty-connection / SIGBUS inside
+      // run_loop::finish). Destroying the connection runs the full
+      // abandonment protocol instead: abandoned_ switches every pump
+      // completion path into its quiet teardown form, so staged cells are
+      // retired silently and no handler can ever run again.
+      //
+      // No session outlives a failed connect: the session died above, so
+      // the member is empty and the later destruction of this operation
+      // state finds nothing left to abandon on another thread.
+      connection_.reset();
       bexec::set_value(std::move(receiver_), ec,
                        imap::logout_state<Allocator>{});
     }
@@ -421,7 +433,6 @@ class connect_operation {
   std::optional<tls_stream> tls_stream_;
   std::optional<imap::imap_connection<Allocator>> connection_;
   std::optional<imap::detail::registration<Allocator>> greeting_registration_;
-  bkmail::detail::string_of<Allocator> tag_;
   std::optional<bexec::detail::pass_through_operation<resolve_op>> resolve_op_;
   std::optional<bexec::detail::pass_through_operation<tcp_connect_op>>
       tcp_connect_op_;
