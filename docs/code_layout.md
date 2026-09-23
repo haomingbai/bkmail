@@ -22,6 +22,17 @@ former top-level `detail/` directory into
 `include/bkmail/common/detail/` (`allocator_ext.h`, `unique_function.h`).
 Namespaces are unchanged; only file locations moved. The affected
 sections (§2, §3.1/§3.1a, §3.6, §6) below have been updated accordingly.
+
+**Migration note (2026-09-23):** `connect.h` has moved from the
+`include/bkmail/` root into `include/bkmail/imap/connect.h` — it is pure
+Layer-2 IMAP functionality and belongs to the imap module, resolving the
+former known issue "connect.h is a real-content top-level header"
+(known_issues.md §1, now removed). The include guard is
+`BKMAIL_IMAP_CONNECT_H_`; namespaces are unchanged. The never-used
+`imap/detail/with_timeout.h` watchdog adaptor has been deleted — the
+watchdog lives inside `imap/state/detail/state_op_sender.h`. The
+affected sections (§2, §3.1, §3.2, §3.5, §7) have been updated
+accordingly.
 §7 is the historical implementation plan and is kept as written, so its
 file lists still use the pre-move paths.
 
@@ -207,7 +218,7 @@ Concrete mapping:
 | model | `bkmail`, `bkmail::imap` | `include/bkmail/common/` + `include/bkmail/imap/` value headers |
 | proto | `bkmail::imap::detail` | `include/bkmail/imap/detail/` |
 | layer1 | `bkmail::imap` (+`detail`) | `include/bkmail/imap/`, `include/bkmail/imap/command/`, `include/bkmail/imap/detail/` |
-| layer2 | `bkmail::imap`, `bkmail` (free functions) | `include/bkmail/imap/state/`, `include/bkmail/imap/imap_connection.h`, `include/bkmail/connect.h` |
+| layer2 | `bkmail::imap`, `bkmail` (free functions) | `include/bkmail/imap/state/`, `include/bkmail/imap/imap_connection.h`, `include/bkmail/imap/connect.h` |
 
 Aggregate headers contain only `#include`s: `bkmail/bkmail.h` (everything),
 `bkmail/imap.h` (layer1 + layer2 + the imap-scoped model types),
@@ -246,15 +257,14 @@ public header is its exact `@brief` content — implementation agents copy it
 verbatim (date: day of authorship, author: Haoming Bai
 \<haomingbai@hotmail.com\>).
 
-### 3.1 `include/bkmail/` — core, connect entry, and aggregate headers
+### 3.1 `include/bkmail/` — core and aggregate headers
 
 | File | Kind | Contents |
 | --- | --- | --- |
 | `export.h` | [H] (exists) | `BKMAIL_EXPORT` macro family. Unchanged. brief: *Export macros for bkmail.* |
 | `version.h` | [H+CPP] (exists) | `bkmail::version()`. Unchanged. brief: *Version information for bkmail.* |
-| `connect.h` | [H] | `bkmail::async_connect`, `bkmail::async_connect_tls`. brief: *IMAP session connect entry points.* |
 | `imap.h` | [AGG] | includes every header of §3.2 + §3.3 + §3.4. brief: *Aggregate header for the bkmail IMAP facility.* |
-| `bkmail.h` | [AGG] (exists) | adds includes of the above and of §3.1a; keeps bnio/bexec umbrella includes. brief: *Aggregate header for the entire bkmail library.* |
+| `bkmail.h` | [AGG] (exists) | adds includes of the above, of §3.1a and of `imap/connect.h`; keeps bnio/bexec umbrella includes. brief: *Aggregate header for the entire bkmail library.* |
 
 ### 3.1a `include/bkmail/common/` — general-purpose data model + error + pack
 
@@ -294,6 +304,7 @@ migration note at the top); namespaces unchanged.
 | `imap/imap_context.h` | [H] | `imap::imap_context<Stream, Allocator>` shell + `detail::context_core<Stream, Allocator>` (the heap-held state shared with the in-flight pump boxes; architecture §3.2a — one coupled group in one file). brief: *IMAP command/connection context owning the stream.* |
 | `imap/imap_connection.h` | [H] | `imap::imap_connection<Allocator>` (variant owner, capability cache, `close()`, STARTTLS relocation hooks, the one-operation-in-flight slot) + `detail::detain_connection` (LOGOUT teardown deferred past the read dispatch). brief: *Owns an IMAP connection across plaintext and TLS.* |
 | `imap/session_state.h` | [H] | forward declarations of the four states only (D9: the `session_state`/`greeting_state` variant aliases are gone). brief: *Forward declarations of the four Layer-2 session states.* |
+| `imap/connect.h` | [H] | `bkmail::async_connect`, `bkmail::async_connect_tls`. brief: *IMAP session connect entry points.* |
 | `imap/command.h` | [AGG] | includes every `imap/command/*.h`, `imap/imap_command.h`. brief: *Aggregate header for all IMAP command types.* |
 
 ### 3.3 `include/bkmail/imap/state/` — Layer 2
@@ -361,7 +372,6 @@ sharing a file would read as one type with a flag — rejected).
 | `detail/fetch_parse.h` | Shared ENVELOPE / BODYSTRUCTURE / FETCH deep parsers used by the fetch command family (coupled-group exception, §4). |
 | `detail/astring.h` | `detail::render_astring`/`render_quoted`/`render_literal` escaping helpers used by every command renderer. |
 | `detail/unsolicited_table.h` | `detail::unsolicited_table` + `detail::registration` move-only token. |
-| `detail/with_timeout.h` | `detail::with_timeout(sender, ioc, duration)` watchdog adaptor (mirrors every value signature of the wrapped sender, D9). |
 | `detail/write_pump.h` | `detail::write_pump<Stream, Allocator>`: staging buffer, batching drain, literal wall, `MSG_NOSIGNAL` write chain. |
 | `detail/read_pump.h` | `detail::read_pump<Stream, Allocator>`: permanent `async_read_some` loop, lexer drive, dispatch into registry + unsolicited table. |
 | `detail/submit_sender.h` | `detail::submit_sender` / `detail::submit_operation`: the sender half of `imap_context::submit<Operation>(args...)`, templated on the context type so the include direction stays one-way. |
@@ -652,7 +662,7 @@ batch all files are independent and may be implemented by parallel agents.
 - **Batch D — Layer 2** (needs C):
   `imap/imap_connection.h`, `imap/session_state.h`,
   `imap/state/detail/state_op_sender.h`, the five `imap/state/*.h`,
-  `imap/detail/with_timeout.h`, `connect.h`, `imap.h` aggregate,
+  `imap/connect.h`, `imap.h` aggregate,
   `bkmail.h` update. Tests: `tests/layer2/`, then `tests/integration/`.
 - **Batch E — examples** (needs D, parallel with D's tests):
   `list_subjects`, `idle_watch`, `batch_commands`.

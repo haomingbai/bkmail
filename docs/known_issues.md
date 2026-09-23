@@ -10,20 +10,7 @@ recorded decision to defer. Usage questions belong in
 
 ---
 
-## 1. `connect.h` is a real-content top-level header
-
-**Statement.** `include/bkmail/connect.h` carries ~450 lines of
-implementation, including a third-party `detail` include, while the
-umbrella-header rule (`docs/code_style.md`, "File organization") says a
-top-level header is umbrella-only.
-
-**Why accepted.** Moving the implementation to `imap/connect.h` is
-mechanical, but it churns the include graph of every consumer that spells
-`<bkmail/connect.h>` directly.
-
-**Revisit.** When the connect surface next changes.
-
-## 2. `detail::registration` is a public-API type in a detail header
+## 1. `detail::registration` is a public-API type in a detail header
 
 **Statement.** `imap::detail::registration<Allocator>` — the token
 returned by `imap_context::on_unsolicited` — is public API, but it lives
@@ -33,10 +20,10 @@ in `imap/detail/unsolicited_table.h`, forcing public headers to include
 **Why accepted.** Renaming or moving the type is an ABI-visible include
 restructure.
 
-**Revisit.** Together with the `connect.h` move (entry 1), so the include
-churn is paid once.
+**Revisit.** With the next ABI-visible include restructure; the free
+ride on the `connect.h` move (2026-09-23) did not carry it.
 
-## 3. Executor and transport coupling
+## 2. Executor and transport coupling
 
 **Statement.** The abstraction is coupled to one executor and one
 transport family: `context_core` hardcodes
@@ -54,7 +41,7 @@ tree; generalizing now would pay abstraction rent for zero users.
 
 **Revisit.** When a second executor or transport actually appears.
 
-## 4. Layer-2 completion lifetime window
+## 3. Layer-2 completion lifetime window
 
 **Statement.** A Layer-2 completion "loser" that is preempted before its
 guard exchange can, in a narrow window, touch an operation state already
@@ -69,7 +56,7 @@ Layer-2 completion record is disproportionate to that probability.
 
 **Revisit.** Any ASan/TSan report near `state_op_operation` / `on_result`.
 
-## 5. `unsolicited_table` concurrency is contract-restricted
+## 4. `unsolicited_table` concurrency is contract-restricted
 
 **Statement.** Concurrent registration or token destruction against
 dispatch remains contract-restricted rather than fully synchronized; the
@@ -83,7 +70,7 @@ the owning thread, dispatch from the read path.
 read-dispatch callers, or concurrent registration becomes a supported
 pattern.
 
-## 6. Documented preconditions without runtime enforcement
+## 5. Documented preconditions without runtime enforcement
 
 **Statement.** Some preconditions are documented but not checked at
 runtime — most prominently "no `set_io_context` during IDLE"
@@ -96,7 +83,7 @@ completion paths for violations the API shape already makes unlikely.
 **Revisit.** When a debug-mode contract-check pass (asserts behind a
 build flag) is added to the library.
 
-## 7. The 29-minute IDLE heartbeat wake path is untested
+## 6. The 29-minute IDLE heartbeat wake path is untested
 
 **Statement.** The wake-on-heartbeat path of `selected_state::idle()`
 (RFC 5550's 29-minute re-issue point, usage.md §2.6) is not covered by

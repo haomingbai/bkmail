@@ -1490,7 +1490,7 @@ Layer 2 (`namespace bkmail::imap`, entry points in `bkmail`):
 `imap/state/selected.h`, `imap/state/logout.h`, `imap/state/idle.h`,
 `imap/state/detail/state_op_sender.h` (state_op_sender + idle_op_sender,
 one coupled group), `imap/session_state.h` (forward declarations of the
-four states), `connect.h` (async_connect / async_connect_tls).
+four states), `imap/connect.h` (async_connect / async_connect_tls).
 
 Data model (`namespace bkmail`): `account_info.h`, `address.h`,
 `envelope.h`, `body_structure.h`, `mail_header.h` (+
