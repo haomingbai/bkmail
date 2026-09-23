@@ -33,7 +33,7 @@
 
 // IMAP facility (layers 1+2 and the imap-scoped model types) and the
 // session connect entry points.
-#include <bkmail/connect.h>
 #include <bkmail/imap.h>
+#include <bkmail/imap/connect.h>
 
 #endif  // BKMAIL_BKMAIL_H_

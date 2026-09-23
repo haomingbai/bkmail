@@ -1,5 +1,5 @@
 /**
- * @file connect.h
+ * @file include/bkmail/imap/connect.h
  * @brief IMAP session connect entry points.
  * @author Haoming Bai <haomingbai@hotmail.com>
  * @date   2026-09-16
@@ -16,8 +16,8 @@
  */
 
 #pragma once
-#ifndef BKMAIL_CONNECT_H_
-#define BKMAIL_CONNECT_H_
+#ifndef BKMAIL_IMAP_CONNECT_H_
+#define BKMAIL_IMAP_CONNECT_H_
 
 #include <bkmail/common/detail/allocator_ext.h>
 #include <bkmail/common/error.h>
@@ -537,4 +537,4 @@ template <class Allocator = std::allocator<std::byte>>
 
 }  // namespace bkmail
 
-#endif  // BKMAIL_CONNECT_H_
+#endif  // BKMAIL_IMAP_CONNECT_H_
